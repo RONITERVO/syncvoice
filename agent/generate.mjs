@@ -76,6 +76,13 @@ export function isPlausibleDuration(text, durationMs) {
   return Number.isFinite(durationMs) && durationMs >= minimumPlausibleDurationMs(text);
 }
 
+export function shortTranscriptMatches(expected, actual) {
+  const source = String(expected).normalize("NFKC").trim();
+  if (!/^[\p{L}\s'-]+$/u.test(source)) return true;
+  const normalize = value => String(value).normalize("NFKC").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/g, " ");
+  return normalize(source) === normalize(actual);
+}
+
 export function characterCues(text, wordCues, durationMs) {
   const words = [...text.matchAll(/\S+/g)];
   if (!words.length) return [{ startMs: 0, endMs: durationMs, startChar: 0, endChar: text.length }];
@@ -136,7 +143,7 @@ function wavFromPcm16(samples, sampleRate) {
   return wav;
 }
 
-export function trimOuterSilence(wav, text) {
+function activityProfile(wav) {
   const { samples, sampleRate } = readPcm16Wav(wav);
   const frameSamples = Math.max(1, Math.round(sampleRate * 0.01));
   const rms = [];
@@ -147,13 +154,20 @@ export function trimOuterSilence(wav, text) {
   }
   const peak = Math.max(0, ...rms);
   if (peak < 200) return null;
-  const threshold = Math.max(180, peak * 0.08);
-  const firstVoicedFrame = rms.findIndex(value => value >= threshold);
-  let lastVoicedFrame = -1;
+  const voicedThreshold = Math.max(180, peak * 0.08);
+  const firstVoiced = rms.findIndex(value => value >= voicedThreshold);
+  let lastVoiced = -1;
   for (let frame = rms.length - 1; frame >= 0; frame -= 1) {
-    if (rms[frame] >= threshold) { lastVoicedFrame = frame; break; }
+    if (rms[frame] >= voicedThreshold) { lastVoiced = frame; break; }
   }
-  if (firstVoicedFrame < 0 || lastVoicedFrame < firstVoicedFrame) return null;
+  if (firstVoiced < 0 || lastVoiced < firstVoiced) return null;
+  return { samples, sampleRate, frameSamples, rms, firstVoiced, lastVoiced, silenceThreshold: Math.max(120, peak * 0.04) };
+}
+
+export function trimOuterSilence(wav, text) {
+  const profile = activityProfile(wav);
+  if (!profile) return null;
+  const { samples, sampleRate, frameSamples, firstVoiced: firstVoicedFrame, lastVoiced: lastVoicedFrame } = profile;
   const paddingSamples = Math.round(sampleRate * 0.08);
   const startSample = Math.max(0, firstVoicedFrame * frameSamples - paddingSamples);
   const endSample = Math.min(samples.length, (lastVoicedFrame + 1) * frameSamples + paddingSamples);
@@ -163,19 +177,125 @@ export function trimOuterSilence(wav, text) {
   return { wav: wavFromPcm16(take, sampleRate), durationMs };
 }
 
+export function extractFirstRepeatedUtterance(wav, text) {
+  const profile = activityProfile(wav);
+  if (!profile || profile.lastVoiced <= profile.firstVoiced) return null;
+  const { samples, sampleRate, frameSamples, rms, firstVoiced, lastVoiced, silenceThreshold } = profile;
+
+  const span = lastVoiced - firstVoiced;
+  const earliestBoundary = firstVoiced + Math.floor(span * 0.4);
+  const latestBoundary = firstVoiced + Math.ceil(span * 0.6);
+  const minimumSilenceFrames = Math.ceil(180 / 10);
+  const candidates = [];
+  let frame = earliestBoundary;
+  while (frame <= latestBoundary) {
+    if (rms[frame] >= silenceThreshold) { frame += 1; continue; }
+    const start = frame;
+    while (frame <= latestBoundary && rms[frame] < silenceThreshold) frame += 1;
+    const end = frame;
+    if (end - start >= minimumSilenceFrames) candidates.push({ start, end });
+  }
+  if (!candidates.length) return null;
+  const midpoint = firstVoiced + span / 2;
+  candidates.sort((left, right) => {
+    const distance = Math.abs((left.start + left.end) / 2 - midpoint) - Math.abs((right.start + right.end) / 2 - midpoint);
+    if (distance !== 0) return distance;
+    return (right.end - right.start) - (left.end - left.start);
+  });
+  const boundary = Math.min(samples.length, candidates[0].start * frameSamples + Math.round(sampleRate * 0.08));
+  return trimOuterSilence(wavFromPcm16(samples.slice(0, boundary), sampleRate), text);
+}
+
+export function extractAnchoredUtterance(wav, text) {
+  const profile = activityProfile(wav);
+  if (!profile || profile.lastVoiced <= profile.firstVoiced) return null;
+  const { samples, sampleRate, frameSamples, rms, firstVoiced, lastVoiced, silenceThreshold } = profile;
+
+  const minimumSilenceFrames = Math.ceil(180 / 10);
+  const minimumTargetFrames = Math.ceil(minimumPlausibleDurationMs(text) / 10);
+  const candidates = [];
+  let frame = firstVoiced + 1;
+  while (frame < lastVoiced) {
+    if (rms[frame] >= silenceThreshold) { frame += 1; continue; }
+    const start = frame;
+    while (frame < lastVoiced && rms[frame] < silenceThreshold) frame += 1;
+    const end = frame;
+    if (end - start >= minimumSilenceFrames && lastVoiced - end >= minimumTargetFrames) candidates.push({ start, end });
+  }
+  if (!candidates.length) return null;
+  candidates.sort((left, right) => (right.end - right.start) - (left.end - left.start));
+  const startSample = Math.max(0, candidates[0].end * frameSamples - Math.round(sampleRate * 0.08));
+  return trimOuterSilence(wavFromPcm16(samples.slice(startSample), sampleRate), text);
+}
+
+export function extractLeadingUtterance(wav, text) {
+  const profile = activityProfile(wav);
+  if (!profile || profile.lastVoiced <= profile.firstVoiced) return null;
+  const { samples, sampleRate, frameSamples, rms, firstVoiced, lastVoiced, silenceThreshold } = profile;
+
+  const minimumSilenceFrames = Math.ceil(180 / 10);
+  const minimumTargetFrames = Math.ceil(minimumPlausibleDurationMs(text) / 10);
+  let frame = firstVoiced + minimumTargetFrames;
+  while (frame < lastVoiced) {
+    if (rms[frame] >= silenceThreshold) { frame += 1; continue; }
+    const start = frame;
+    while (frame < lastVoiced && rms[frame] < silenceThreshold) frame += 1;
+    const end = frame;
+    if (end - start < minimumSilenceFrames || lastVoiced - end < 25) continue;
+    const endSample = Math.min(samples.length, start * frameSamples + Math.round(sampleRate * 0.08));
+    return trimOuterSilence(wavFromPcm16(samples.slice(0, endSample), sampleRate), text);
+  }
+  return null;
+}
+
 export async function generateEntrySpeech(entry, apiKey) {
-  const generated = await generateSpeech(entry, apiKey);
-  if (!isPlausibleDuration(entry.text, generated.durationMs)) throw new Error("Gemini returned implausibly short audio.");
   const words = entry.text.match(/\S+/g) || [];
-  if (words.length > 3) return generated;
-  const trimmed = trimOuterSilence(generated.wav, entry.text);
-  if (!trimmed) throw new Error("Gemini audio did not contain a complete voiced utterance.");
+  let firstError;
+  try {
+    const generated = await generateSpeech(entry, apiKey);
+    if (!isPlausibleDuration(entry.text, generated.durationMs)) throw new Error("Gemini returned implausibly short audio.");
+    if (words.length > 3) return generated;
+    if (generated.transcriptObserved && !shortTranscriptMatches(entry.text, generated.transcript)) throw new Error(`Gemini spoke different short text: ${generated.transcript}`);
+    const trimmed = trimOuterSilence(generated.wav, entry.text);
+    if (!trimmed) throw new Error("Gemini audio did not contain a complete voiced utterance.");
+    const cues = words.map((word, index) => ({
+      word,
+      startMs: Math.round(trimmed.durationMs * index / Math.max(1, words.length)),
+      endMs: Math.round(trimmed.durationMs * (index + 1) / Math.max(1, words.length)),
+    }));
+    return { ...generated, ...trimmed, transcript: entry.text, cues };
+  } catch (error) {
+    firstError = error;
+  }
+  if (words.length > 3) throw firstError;
+
+  let recoverySource;
+  let recovered;
+  try {
+    recoverySource = await generateSpeech(entry, apiKey, { repeatShort: true });
+    recovered = extractFirstRepeatedUtterance(recoverySource.wav, entry.text);
+  } catch {
+    // The anchored recovery below is deliberately the final, bounded fallback.
+  }
+  if (!recovered) {
+    try {
+      recoverySource = await generateSpeech(entry, apiKey, { anchorShort: true });
+      recovered = extractAnchoredUtterance(recoverySource.wav, entry.text);
+    } catch {
+      // A phrase-specific model refusal may still accept an educational suffix.
+    }
+  }
+  if (!recovered) {
+    recoverySource = await generateSpeech(entry, apiKey, { contextShort: true });
+    recovered = extractLeadingUtterance(recoverySource.wav, entry.text);
+  }
+  if (!recovered) throw new Error(`Short-utterance recovery had no proven boundary (initial error: ${firstError instanceof Error ? firstError.message : String(firstError)}).`);
   const cues = words.map((word, index) => ({
     word,
-    startMs: Math.round(trimmed.durationMs * index / Math.max(1, words.length)),
-    endMs: Math.round(trimmed.durationMs * (index + 1) / Math.max(1, words.length)),
+    startMs: Math.round(recovered.durationMs * index / Math.max(1, words.length)),
+    endMs: Math.round(recovered.durationMs * (index + 1) / Math.max(1, words.length)),
   }));
-  return { ...generated, ...trimmed, transcript: entry.text, cues };
+  return { ...recoverySource, ...recovered, transcript: entry.text, cues, wakeMode: "audio-bounded-recovery" };
 }
 
 async function acquireGenerationLock(root) {

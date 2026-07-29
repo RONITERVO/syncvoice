@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { buildAgentPrompt, modelForMode } from "../agent/contract.mjs";
-import { assetLocations, characterCues, isPlausibleDuration, minimumPlausibleDurationMs, readyInAssetRoot, selectedManifestEntries, trimOuterSilence } from "../agent/generate.mjs";
+import { assetLocations, characterCues, extractAnchoredUtterance, extractFirstRepeatedUtterance, extractLeadingUtterance, isPlausibleDuration, minimumPlausibleDurationMs, readyInAssetRoot, selectedManifestEntries, shortTranscriptMatches, trimOuterSilence } from "../agent/generate.mjs";
 import { TRIGGER_AUDIO_PCM, TRIGGER_SAMPLE_RATE } from "../agent/trigger-audio.mjs";
 import { needsAudioWake } from "../agent/gemini-tts.mjs";
 
@@ -86,6 +86,62 @@ test("trims only the outer silence around an exact short utterance", () => {
 test("does not publish audio without a voiced utterance", () => {
   const wav = syntheticWav([{ durationMs: 900, amplitude: 0 }]);
   assert.equal(trimOuterSilence(wav, "escuela"), null);
+});
+
+test("validates observed alphabetic short transcripts without overreaching on numbers", () => {
+  assert.equal(shortTranscriptMatches("kulttuurinen erottelu", "Kulttuurinen erottelu."), true);
+  assert.equal(shortTranscriptMatches("kulttuurinen erottelu", "kulttuurinen ulottuvuus"), false);
+  assert.equal(shortTranscriptMatches("9,58 UA", "nine point five eight AU"), true);
+});
+
+test("recovers the first copy only when a repeated short utterance has a proven pause", () => {
+  const wav = syntheticWav([
+    { durationMs: 200, amplitude: 0 }, { durationMs: 650, amplitude: 9_000 }, { durationMs: 300, amplitude: 0 },
+    { durationMs: 650, amplitude: 9_000 }, { durationMs: 200, amplitude: 0 },
+  ]);
+  const take = extractFirstRepeatedUtterance(wav, "sexual reproduction");
+  assert.ok(take);
+  assert.ok(take.durationMs >= 790 && take.durationMs <= 830, `unexpected duration ${take.durationMs}`);
+});
+
+test("rejects repeated short audio without a safe internal pause", () => {
+  const wav = syntheticWav([
+    { durationMs: 200, amplitude: 0 }, { durationMs: 1_400, amplitude: 9_000 }, { durationMs: 200, amplitude: 0 },
+  ]);
+  assert.equal(extractFirstRepeatedUtterance(wav, "sexual reproduction"), null);
+});
+
+test("prefers the repetition midpoint over a longer pause between words", () => {
+  const wav = syntheticWav([
+    { durationMs: 150, amplitude: 0 },
+    { durationMs: 300, amplitude: 9_000 }, { durationMs: 260, amplitude: 0 }, { durationMs: 300, amplitude: 9_000 },
+    { durationMs: 200, amplitude: 0 },
+    { durationMs: 300, amplitude: 9_000 }, { durationMs: 260, amplitude: 0 }, { durationMs: 300, amplitude: 9_000 },
+    { durationMs: 150, amplitude: 0 },
+  ]);
+  const take = extractFirstRepeatedUtterance(wav, "kulttuurinen erottelu");
+  assert.ok(take);
+  assert.ok(take.durationMs >= 1_000, `unexpectedly kept only one word (${take.durationMs}ms)`);
+});
+
+test("removes a neutral anchor only when a safe pause precedes the target", () => {
+  const wav = syntheticWav([
+    { durationMs: 200, amplitude: 0 }, { durationMs: 400, amplitude: 9_000 }, { durationMs: 300, amplitude: 0 },
+    { durationMs: 650, amplitude: 9_000 }, { durationMs: 200, amplitude: 0 },
+  ]);
+  const take = extractAnchoredUtterance(wav, "sexual reproduction");
+  assert.ok(take);
+  assert.ok(take.durationMs >= 790 && take.durationMs <= 830, `unexpected duration ${take.durationMs}`);
+});
+
+test("keeps a leading short target only when a safe context pause follows it", () => {
+  const wav = syntheticWav([
+    { durationMs: 200, amplitude: 0 }, { durationMs: 650, amplitude: 9_000 }, { durationMs: 350, amplitude: 0 },
+    { durationMs: 1_600, amplitude: 9_000 }, { durationMs: 200, amplitude: 0 },
+  ]);
+  const take = extractLeadingUtterance(wav, "sexual reproduction");
+  assert.ok(take);
+  assert.ok(take.durationMs >= 790 && take.durationMs <= 830, `unexpected duration ${take.durationMs}`);
 });
 
 test("selects locale shards without changing manifest entry identity", () => {
