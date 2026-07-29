@@ -58,7 +58,7 @@ Large web projects can keep full-quality audio outside the application repositor
 npm run agent:generate -- --manifest D:/game/.syncvoice/project.json --env D:/keys/.env --locale en-US,fi-FI --asset-root D:/game-audio/assets/syncvoice
 ```
 
-The generation state remains beside the source manifest, so rerunning the same shard skips completed entries. Use a stable public asset origin in the game runtime. For GitHub Pages, keep every published application or companion asset repository comfortably below the platform's 1 GiB site limit; Git LFS objects are not served by Pages.
+The generation state remains beside the source manifest. Before skipping a completed entry, SyncVoice verifies that its expected audio and transcript files both exist under the active output root; moving to a new shard root therefore regenerates only assets absent from that root. Use a stable public asset origin in the game runtime. For GitHub Pages, keep every published application or companion asset repository comfortably below the platform's 1 GiB site limit; Git LFS objects are not served by Pages.
 
 The Production agent panel exposes the same options as **Locales** and **Asset output folder**, so large-project sharding does not require a hand-written command.
 

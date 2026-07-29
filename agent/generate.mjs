@@ -41,6 +41,31 @@ export function selectedManifestEntries(entries, locales) {
   return entries.filter(entry => allowed.has(entry.locale));
 }
 
+export function assetLocations(entry, audioFormat, flatPaths) {
+  const locale = safePart(entry.locale || "und");
+  const id = safePart(entry.externalId);
+  return {
+    audioRelative: flatPaths ? `audio/${id}.${audioFormat}` : `audio/${locale}/${id}.${audioFormat}`,
+    transcriptRelative: flatPaths ? `transcripts/${id}.json` : `transcripts/${locale}/${id}.json`,
+  };
+}
+
+export async function readyInAssetRoot(entry, prior, hash, assetRoot, audioFormat, flatPaths) {
+  if (!prior || prior.hash !== hash || !prior.audio || !prior.transcript || !isPlausibleDuration(entry.text, Number(prior.durationMs))) return false;
+  const expected = assetLocations(entry, audioFormat, flatPaths);
+  if (prior.audio !== expected.audioRelative || prior.transcript !== expected.transcriptRelative) return false;
+  try {
+    await Promise.all([
+      fs.access(path.join(assetRoot, expected.audioRelative)),
+      fs.access(path.join(assetRoot, expected.transcriptRelative)),
+    ]);
+    prior.assetRoot = assetRoot;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function minimumPlausibleDurationMs(text) {
   const words = String(text).trim().match(/\S+/g) || [];
   const spokenCharacters = String(text).replace(/\s+/g, "").length;
@@ -179,6 +204,7 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
   if (!keys.length) throw new Error("No GEMINI_API_KEY1…4 values were found.");
   const assetRoot = path.resolve(root, assetRootOverride || project.project?.assetRoot || "assets/syncvoice");
   const audioFormat = String(project.project?.audioFormat || "wav").toLowerCase();
+  const flatPaths = Boolean(assetRootOverride || project.project?.assetRoot);
   const statePath = path.join(root, ".syncvoice", "generation-state.json");
   const state = JSON.parse(await fs.readFile(statePath, "utf8").catch(() => "{\"version\":1,\"entries\":{}}"));
   state.version = 1; state.model = TTS_MODEL; state.entries ||= {};
@@ -186,19 +212,19 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
   const checkpointState = () => (checkpoint = checkpoint.then(() => writeJsonAtomic(statePath, state)));
   const selectedEntries = selectedManifestEntries(project.entries, locales);
   if (locales && !selectedEntries.length) throw new Error(`No manifest entries matched locale filter: ${String(locales)}`);
-  const pending = selectedEntries.filter((entry) => {
-    const hash = hashEntry(entry); const prior = state.entries[entry.externalId];
-    return !prior || prior.hash !== hash || !prior.audio || !isPlausibleDuration(entry.text, Number(prior.durationMs));
-  }).slice(0, Number.isFinite(limit) ? limit : undefined);
+  const readiness = await Promise.all(selectedEntries.map(entry => {
+    const hash = hashEntry(entry);
+    return readyInAssetRoot(entry, state.entries[entry.externalId], hash, assetRoot, audioFormat, flatPaths);
+  }));
+  const pending = selectedEntries.filter((_, index) => !readiness[index]).slice(0, Number.isFinite(limit) ? limit : undefined);
+  await checkpointState();
   let cursor = 0; let completed = 0; let failed = 0;
 
   async function worker(workerIndex) {
     while (cursor < pending.length) {
       if (signal?.aborted) return;
-      const entry = pending[cursor++]; const hash = hashEntry(entry); const locale = safePart(entry.locale || "und"); const id = safePart(entry.externalId);
-      const flatPaths = Boolean(project.project?.assetRoot);
-      const audioRelative = flatPaths ? `audio/${id}.${audioFormat}` : `audio/${locale}/${id}.${audioFormat}`;
-      const transcriptRelative = flatPaths ? `transcripts/${id}.json` : `transcripts/${locale}/${id}.json`;
+      const entry = pending[cursor++]; const hash = hashEntry(entry);
+      const { audioRelative, transcriptRelative } = assetLocations(entry, audioFormat, flatPaths);
       const audioPath = path.join(assetRoot, audioRelative); const transcriptPath = path.join(assetRoot, transcriptRelative);
       let lastError;
       for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -207,7 +233,7 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
           const generated = await generateEntrySpeech(entry, keys[(workerIndex + attempt - 1) % keys.length]);
           await writeAudio(audioPath, generated.wav, audioFormat);
           await writeJsonAtomic(transcriptPath, { version: 1, externalId: entry.externalId, text: entry.text, durationMs: generated.durationMs, cues: characterCues(entry.text, generated.cues, generated.durationMs) });
-          state.entries[entry.externalId] = { hash, audio: audioRelative.replaceAll("\\", "/"), transcript: transcriptRelative.replaceAll("\\", "/"), durationMs: generated.durationMs, generatedAt: new Date().toISOString() };
+          state.entries[entry.externalId] = { hash, assetRoot, audio: audioRelative.replaceAll("\\", "/"), transcript: transcriptRelative.replaceAll("\\", "/"), durationMs: generated.durationMs, generatedAt: new Date().toISOString() };
           completed += 1; await checkpointState(); onProgress({ type: "generated", completed, failed, total: pending.length, id: entry.externalId }); lastError = null; break;
         } catch (error) { lastError = error; if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, attempt * 2_000)); }
       }
@@ -216,7 +242,12 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
   }
   await fs.mkdir(assetRoot, { recursive: true });
   await Promise.all(Array.from({ length: Math.max(1, Math.min(Number(concurrency) || 1, 8)) }, (_, index) => worker(index)));
-  const runtimeEntries = selectedEntries.map((entry) => ({ ...entry, ...(state.entries[entry.externalId] || {}) })).filter((entry) => entry.audio);
+  const runtimeEntries = (await Promise.all(selectedEntries.map(async entry => {
+    const prior = state.entries[entry.externalId];
+    return await readyInAssetRoot(entry, prior, hashEntry(entry), assetRoot, audioFormat, flatPaths)
+      ? { ...entry, ...prior }
+      : null;
+  }))).filter(Boolean);
   await writeJsonAtomic(path.join(assetRoot, "manifest.json"), { version: 1, project: project.project, model: TTS_MODEL, generatedAt: new Date().toISOString(), entries: runtimeEntries });
   return { discovered: project.entries.length, selected: selectedEntries.length, pending: pending.length, completed, failed, ready: runtimeEntries.length, paused: Boolean(signal?.aborted), assetRoot };
   } finally {

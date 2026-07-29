@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 import { buildAgentPrompt, modelForMode } from "../agent/contract.mjs";
-import { characterCues, isPlausibleDuration, minimumPlausibleDurationMs, selectedManifestEntries, trimOuterSilence } from "../agent/generate.mjs";
+import { assetLocations, characterCues, isPlausibleDuration, minimumPlausibleDurationMs, readyInAssetRoot, selectedManifestEntries, trimOuterSilence } from "../agent/generate.mjs";
 import { TRIGGER_AUDIO_PCM, TRIGGER_SAMPLE_RATE } from "../agent/trigger-audio.mjs";
 import { needsAudioWake } from "../agent/gemini-tts.mjs";
 
@@ -92,6 +95,29 @@ test("selects locale shards without changing manifest entry identity", () => {
     { externalId: "fi", locale: "fi-FI" },
   ];
   assert.equal(selectedManifestEntries(entries), entries);
-  assert.deepEqual(selectedManifestEntries(entries, "en-US,fi-FI"), entries.slice(1));
-  assert.deepEqual(selectedManifestEntries(entries, ["fi-FI"]), [entries[2]]);
+  const selected = selectedManifestEntries(entries, "en-US,fi-FI");
+  assert.deepEqual(selected, entries.slice(1));
+  assert.strictEqual(selected[0], entries[1]);
+  const finnish = selectedManifestEntries(entries, ["fi-FI"]);
+  assert.deepEqual(finnish, [entries[2]]);
+  assert.strictEqual(finnish[0], entries[2]);
+});
+
+test("resumes an entry only when both assets exist in the active output root", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "syncvoice-root-"));
+  try {
+    const entry = { externalId: "quest.intro", locale: "en-US", text: "Welcome home." };
+    const hash = "casting-hash";
+    const locations = assetLocations(entry, "mp3", true);
+    const prior = { hash, ...locations, audio: locations.audioRelative, transcript: locations.transcriptRelative, durationMs: 1_200 };
+    assert.equal(await readyInAssetRoot(entry, prior, hash, root, "mp3", true), false);
+    await fs.mkdir(path.join(root, "audio"), { recursive: true });
+    await fs.mkdir(path.join(root, "transcripts"), { recursive: true });
+    await fs.writeFile(path.join(root, locations.audioRelative), "audio");
+    await fs.writeFile(path.join(root, locations.transcriptRelative), "{}");
+    assert.equal(await readyInAssetRoot(entry, prior, hash, root, "mp3", true), true);
+    assert.equal(prior.assetRoot, root);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

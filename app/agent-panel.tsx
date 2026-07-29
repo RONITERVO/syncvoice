@@ -130,7 +130,7 @@ export function AgentPanel() {
               <div className="agent-run">
                 <div className="agent-run-head"><span className={`agent-run-state ${job.status}`}>{job.status === "running" && <LoaderCircle className="spin" size={13} />}{job.status}</span>{job.status === "running" ? <button onClick={() => void pause()}>Pause safely</button> : job.output?.result?.entriesDiscovered !== undefined && <span>{job.output.result.entriesDiscovered.toLocaleString()} entries discovered</span>}</div>
                 <div className="agent-events">{latestEvents.map((event, index) => <div key={`${event.at}-${index}`}><i /><span>{event.message}</span></div>)}</div>
-                {job.output?.result?.summary && <div className="agent-result"><strong>Agent handoff</strong><p>{job.output.result.summary}</p>{Boolean(job.output.result.filesChanged?.length) && <small>{job.output.result.filesChanged!.length} files changed</small>}</div>}
+                {job.output?.result?.summary && <div className="agent-result"><strong>Agent handoff</strong><p>{job.output.result.summary}</p>{Boolean(job.output.result.filesChanged?.length) && <div className="agent-result-paths"><small>{job.output.result.filesChanged!.length} output paths</small>{job.output.result.filesChanged!.map(file => <code key={file}>{file}</code>)}</div>}</div>}
               </div>
             )}
           </section>
