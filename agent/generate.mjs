@@ -85,9 +85,25 @@ async function generateEntrySpeech(entry, apiKey) {
   }
 }
 
+async function acquireGenerationLock(root) {
+  const lockPath = path.join(root, ".syncvoice", "generation.lock");
+  await fs.mkdir(path.dirname(lockPath), { recursive: true });
+  try {
+    const handle = await fs.open(lockPath, "wx");
+    await handle.writeFile(`${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`);
+    return { handle, lockPath };
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const owner = await fs.readFile(lockPath, "utf8").catch(() => "another process");
+    throw new Error(`A SyncVoice generation job is already active (${owner.trim()}).`);
+  }
+}
+
 export async function generateManifest({ manifestPath, envPath, limit = Infinity, concurrency = 4, signal, onProgress = console.log }) {
   const absoluteManifest = path.resolve(manifestPath);
   const root = path.resolve(path.dirname(absoluteManifest), "..");
+  const lock = await acquireGenerationLock(root);
+  try {
   const project = JSON.parse(await fs.readFile(absoluteManifest, "utf8"));
   if (project.version !== 1 || !Array.isArray(project.entries)) throw new Error("Expected a SyncVoice version 1 manifest with an entries array.");
   const env = envPath ? parseEnv(await fs.readFile(path.resolve(envPath), "utf8")) : process.env;
@@ -133,6 +149,10 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
   const runtimeEntries = project.entries.map((entry) => ({ ...entry, ...(state.entries[entry.externalId] || {}) })).filter((entry) => entry.audio);
   await writeJsonAtomic(path.join(assetRoot, "manifest.json"), { version: 1, project: project.project, model: TTS_MODEL, generatedAt: new Date().toISOString(), entries: runtimeEntries });
   return { discovered: project.entries.length, pending: pending.length, completed, failed, ready: runtimeEntries.length, paused: Boolean(signal?.aborted), assetRoot };
+  } finally {
+    await lock.handle.close().catch(() => undefined);
+    await fs.rm(lock.lockPath, { force: true });
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1].replaceAll("\\", "/")}` || process.argv[1]?.endsWith("generate.mjs")) {
