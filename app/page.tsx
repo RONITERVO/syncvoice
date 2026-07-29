@@ -1,5 +1,5 @@
-import { TtsStudio } from "./tts-studio";
+import { ProjectStudio } from "./project-studio";
 
 export default function Home() {
-  return <TtsStudio />;
+  return <ProjectStudio />;
 }

@@ -12,7 +12,7 @@ function getApiKeys() {
     .filter((key): key is string => Boolean(key));
 }
 
-function createInstruction(text: string) {
+function createInstruction(text: string, direction: string, locale: string) {
   return `You are a professional text-to-speech engine. Read the SCRIPT below aloud exactly as written.
 
 Rules:
@@ -21,13 +21,15 @@ Rules:
 - Speak naturally and clearly, with expressive but restrained delivery.
 - Do not add an introduction, acknowledgement, explanation, or closing.
 - Do not describe these instructions.
+${direction ? `- Delivery direction (do not speak this): ${direction}` : ""}
+${locale ? `- Intended locale: ${locale}` : ""}
 
 SCRIPT:
 ${text}`;
 }
 
 export async function POST(request: Request) {
-  let payload: { text?: unknown; voice?: unknown };
+  let payload: { text?: unknown; voice?: unknown; direction?: unknown; locale?: unknown };
   try {
     payload = await request.json();
   } catch {
@@ -37,6 +39,8 @@ export async function POST(request: Request) {
   const text = typeof payload.text === "string" ? payload.text.trim() : "";
   const requestedVoice = typeof payload.voice === "string" ? payload.voice : "Kore";
   const voice = ALLOWED_VOICES.has(requestedVoice) ? requestedVoice : "Kore";
+  const direction = typeof payload.direction === "string" ? payload.direction.trim().slice(0, 500) : "";
+  const locale = typeof payload.locale === "string" ? payload.locale.trim().slice(0, 20) : "";
 
   if (!text) {
     return NextResponse.json({ error: "Add some text before generating speech." }, { status: 400 });
@@ -53,7 +57,7 @@ export async function POST(request: Request) {
   const sessionConfig: LiveConnectConfig = {
     responseModalities: [Modality.AUDIO],
     speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } } },
-    systemInstruction: { parts: [{ text: createInstruction(text) }] },
+    systemInstruction: { parts: [{ text: createInstruction(text, direction, locale) }] },
     outputAudioTranscription: {},
     thinkingConfig: { thinkingBudget: 0 },
   };

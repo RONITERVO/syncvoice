@@ -15,19 +15,19 @@ export async function generateMetadata(): Promise<Metadata> {
 
   return {
     metadataBase,
-    title: "SyncVoice — TTS, in perfect time",
-    description: "Create natural Gemini speech with a transcript that follows every word.",
+    title: "SyncVoice — Game dialogue production",
+    description: "Turn complete game scripts into production-ready Gemini voices, synchronized transcripts, and engine-ready releases.",
     icons: { icon: "/og.png", shortcut: "/og.png" },
     openGraph: {
       title: "SyncVoice",
-      description: "TTS, in perfect time.",
+      description: "From complete game script to synchronized voice release.",
       type: "website",
       images: [{ url: socialImage, width: 1200, height: 630, alt: "SyncVoice audio waveform and synchronized transcript" }],
     },
     twitter: {
       card: "summary_large_image",
       title: "SyncVoice",
-      description: "TTS, in perfect time.",
+      description: "From complete game script to synchronized voice release.",
       images: [socialImage],
     },
   };
