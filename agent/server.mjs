@@ -100,7 +100,7 @@ const server = http.createServer(async (request, response) => {
       const body = await readJson(request);
       if (!new Set(["plan", "apply", "generate"]).has(body.mode)) return send(request, response, 400, { error: "Mode must be plan, apply, or generate." });
       const now = Date.now();
-      const job = { id: crypto.randomUUID(), status: "queued", mode: body.mode, workspace: String(body.workspace || ""), mission: String(body.mission || "").slice(0, 8_000), envPath: String(body.envPath || ""), generationLocales: String(body.generationLocales || "").slice(0, 500), assetRoot: String(body.assetRoot || "").slice(0, 4_000), concurrency: Math.max(1, Math.min(4, Number(body.concurrency) || 4)), allowDirty: body.allowDirty === true, controller: new AbortController(), createdAt: now, updatedAt: now, events: [], output: null, error: null };
+      const job = { id: crypto.randomUUID(), status: "queued", mode: body.mode, workspace: String(body.workspace || ""), mission: String(body.mission || "").slice(0, 8_000), envPath: String(body.envPath || ""), generationLocales: String(body.generationLocales || "").slice(0, 500), assetRoot: String(body.assetRoot || "").slice(0, 4_000), concurrency: Math.max(1, Math.min(8, Number(body.concurrency) || 4)), allowDirty: body.allowDirty === true, controller: new AbortController(), createdAt: now, updatedAt: now, events: [], output: null, error: null };
       jobs.set(job.id, job);
       void startJob(job);
       return send(request, response, 202, publicJob(job));

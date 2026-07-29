@@ -50,7 +50,7 @@ External IDs are permanent. Extraction must be deterministic and sorted. The gen
 - Codex network access and web search are disabled.
 - The agent does not commit, push, or receive TTS credentials.
 
-The companion's Generate job launches the deterministic Gemini runner outside the Codex process. Four keys may work concurrently, progress is streamed into the app, and `.syncvoice/generation-state.json` makes a stopped or restarted job resume only entries whose text/casting hash is still pending.
+The companion's Generate job launches the deterministic Gemini runner outside the Codex process. Up to eight workers are distributed round-robin across the available keys, progress is streamed into the app, and `.syncvoice/generation-state.json` makes a stopped or restarted job resume only entries whose text/casting hash is still pending. The UI defaults to four workers; large offline runs can opt into eight after confirming their provider quota.
 
 Large web projects can keep full-quality audio outside the application repository without losing resumability. `--locale` selects one or more locale shards and `--asset-root` routes their generated audio, transcripts, and runtime manifest to a companion repository or object-storage staging directory:
 

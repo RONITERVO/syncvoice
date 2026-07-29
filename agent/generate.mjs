@@ -215,7 +215,7 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
     }
   }
   await fs.mkdir(assetRoot, { recursive: true });
-  await Promise.all(Array.from({ length: Math.max(1, Math.min(Number(concurrency) || 1, keys.length, 8)) }, (_, index) => worker(index)));
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(Number(concurrency) || 1, 8)) }, (_, index) => worker(index)));
   const runtimeEntries = selectedEntries.map((entry) => ({ ...entry, ...(state.entries[entry.externalId] || {}) })).filter((entry) => entry.audio);
   await writeJsonAtomic(path.join(assetRoot, "manifest.json"), { version: 1, project: project.project, model: TTS_MODEL, generatedAt: new Date().toISOString(), entries: runtimeEntries });
   return { discovered: project.entries.length, selected: selectedEntries.length, pending: pending.length, completed, failed, ready: runtimeEntries.length, paused: Boolean(signal?.aborted), assetRoot };
