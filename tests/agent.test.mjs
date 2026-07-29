@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { buildAgentPrompt, modelForMode } from "../agent/contract.mjs";
 import { assetLocations, characterCues, extractAnchoredUtterance, extractFirstRepeatedUtterance, extractLeadingUtterance, isPlausibleDuration, minimumPlausibleDurationMs, readyInAssetRoot, selectedManifestEntries, shortTranscriptMatches, trimOuterSilence } from "../agent/generate.mjs";
+import { normalizeManifestCues } from "../agent/normalize-cues.mjs";
 import { TRIGGER_AUDIO_PCM, TRIGGER_SAMPLE_RATE } from "../agent/trigger-audio.mjs";
 import { needsAudioWake } from "../agent/gemini-tts.mjs";
 
@@ -63,6 +64,7 @@ test("normalizes word timing into complete contiguous character cues", () => {
     { word: "feliz.", startMs: 700, endMs: 1000 },
   ], 1000);
   assert.deepEqual(cues.map(({ startChar, endChar }) => [startChar, endChar]), [[0, 6], [6, 12], [12, text.length]]);
+  assert.deepEqual(cues.map(({ startMs, endMs }) => [startMs, endMs]), [[0, 333], [333, 667], [667, 1000]]);
   assert.equal(cues.at(-1).endMs, 1000);
 });
 
@@ -173,6 +175,30 @@ test("resumes an entry only when both assets exist in the active output root", a
     await fs.writeFile(path.join(root, locations.transcriptRelative), "{}");
     assert.equal(await readyInAssetRoot(entry, prior, hash, root, "mp3", true), true);
     assert.equal(prior.assetRoot, root);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("normalizes an existing transcript without touching audio", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "syncvoice-cues-"));
+  try {
+    const manifestPath = path.join(root, ".syncvoice", "project.json");
+    const transcriptPath = path.join(root, "assets", "syncvoice", "transcripts", "line.json");
+    await fs.mkdir(path.dirname(manifestPath), { recursive: true });
+    await fs.mkdir(path.dirname(transcriptPath), { recursive: true });
+    await fs.writeFile(manifestPath, JSON.stringify({
+      project: { assetRoot: "assets/syncvoice", audioFormat: "mp3" },
+      entries: [{ externalId: "line", locale: "en-US", text: "hello world" }],
+    }));
+    await fs.writeFile(transcriptPath, JSON.stringify({
+      version: 1, externalId: "line", text: "hello world", durationMs: 1_000,
+      cues: [{ startMs: 0, endMs: 100, startChar: 0, endChar: 6 }, { startMs: 100, endMs: 200, startChar: 6, endChar: 11 }],
+    }));
+    const result = await normalizeManifestCues({ manifestPath, locales: "en-US" });
+    const transcript = JSON.parse(await fs.readFile(transcriptPath, "utf8"));
+    assert.equal(result.changed, 1);
+    assert.deepEqual(transcript.cues.map(cue => [cue.startMs, cue.endMs]), [[0, 500], [500, 1_000]]);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

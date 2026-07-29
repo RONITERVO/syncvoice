@@ -86,15 +86,12 @@ export function shortTranscriptMatches(expected, actual) {
 export function characterCues(text, wordCues, durationMs) {
   const words = [...text.matchAll(/\S+/g)];
   if (!words.length) return [{ startMs: 0, endMs: durationMs, startChar: 0, endChar: text.length }];
-  const cues = words.map((match, index) => {
-    const timed = wordCues.length === words.length ? wordCues[index] : null;
-    return {
-      startMs: timed ? Math.max(0, Math.min(durationMs, timed.startMs)) : Math.round(durationMs * index / words.length),
-      endMs: timed ? Math.max(0, Math.min(durationMs, timed.endMs)) : Math.round(durationMs * (index + 1) / words.length),
-      startChar: index === 0 ? 0 : match.index,
-      endChar: index + 1 < words.length ? words[index + 1].index : text.length,
-    };
-  });
+  const cues = words.map((match, index) => ({
+    startMs: Math.round(durationMs * index / words.length),
+    endMs: Math.round(durationMs * (index + 1) / words.length),
+    startChar: index === 0 ? 0 : match.index,
+    endChar: index + 1 < words.length ? words[index + 1].index : text.length,
+  }));
   return cues.map((cue, index) => ({ ...cue, startChar: index === 0 ? 0 : cues[index - 1].endChar, endMs: Math.max(cue.startMs, cue.endMs) }));
 }
 
