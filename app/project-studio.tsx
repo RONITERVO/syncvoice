@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { AgentPanel } from "@/app/agent-panel";
 import { generateDialogueAudio } from "@/lib/client/gemini-tts";
 import type { ImportedEntry, ProjectCharacter, ProjectDetail, ProjectEntry, ProjectSummary, TimedWord } from "@/lib/project-types";
 
@@ -414,6 +415,7 @@ export function ProjectStudio() {
         <Link className="brand" href="/"><span className="brand-mark"><AudioLines size={20} /></span><span>SYNCVOICE</span></Link>
         <div className="projects-top-actions">
           <span className="cloud-state"><Cloud size={14} /><i /> Cloud saved</span>
+          <AgentPanel />
           <a href="/quick" className="quick-link"><Sparkles size={14} /> Quick studio</a>
         </div>
       </header>
