@@ -71,3 +71,25 @@ npm run db:generate
 ```
 
 Gemini keys are loaded from ignored environment files as `GEMINI_API_KEY1` through `GEMINI_API_KEY4` and are never included in client bundles.
+
+## Codex Production Agent
+
+SyncVoice includes a local Codex companion for handing an entire repository's voice-production workflow to an agent. The hosted UI is the control surface; repository access remains local and uses the signed-in Codex CLI session.
+
+```bash
+npm run agent
+```
+
+Open **Production agent** in SyncVoice, paste the pairing token printed by the companion, and select a Git repository. **Analyze safely** is read-only. **Apply production plan** can write only inside the selected repository, refuses a dirty worktree by default, and never commits or pushes. **Generate assets** runs Gemini separately with the selected local keys file, checkpoints every completed line, and can pause safely after active clips finish.
+
+For scripted use:
+
+```bash
+npm run agent:plan -- D:\Projects\MyGame "Inventory and plan all spoken content"
+npm run agent:apply -- D:\Projects\MyGame "Create the manifest and integrate synchronized playback"
+npm run agent:generate -- --manifest D:\Projects\MyGame\.syncvoice\project.json --env D:\secure\tts.env
+```
+
+The agent creates a deterministic `.syncvoice/project.json`. Audio generation is content-addressed and resumable: unchanged IDs, text, voices, and direction are skipped. Generated WAV and word-timing JSON live under `assets/syncvoice`, with a runtime `manifest.json` for game integration.
+
+The companion deliberately does not receive Gemini keys. The generator reads them only for its own process from the specified environment file.
