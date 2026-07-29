@@ -3,6 +3,7 @@ import test from "node:test";
 import { buildAgentPrompt, modelForMode } from "../agent/contract.mjs";
 import { characterCues, isPlausibleDuration, minimumPlausibleDurationMs, trimOuterSilence } from "../agent/generate.mjs";
 import { TRIGGER_AUDIO_PCM, TRIGGER_SAMPLE_RATE } from "../agent/trigger-audio.mjs";
+import { needsAudioWake } from "../agent/gemini-tts.mjs";
 
 function syntheticWav(parts, sampleRate = 24_000) {
   const samples = [];
@@ -30,10 +31,16 @@ test("routes inventory and implementation to the intended Codex tiers", () => {
   }
 });
 
-test("ships a valid sub-two-second PCM wake-up recording", () => {
+test("ships a trimmed sub-second PCM wake-up recording", () => {
   assert.equal(TRIGGER_SAMPLE_RATE, 24_000);
   assert.ok(TRIGGER_AUDIO_PCM.length >= 1_000);
-  assert.ok(TRIGGER_AUDIO_PCM.length / 2 / TRIGGER_SAMPLE_RATE < 2);
+  assert.ok(TRIGGER_AUDIO_PCM.length / 2 / TRIGGER_SAMPLE_RATE < 0.75);
+});
+
+test("reserves the audio wake-up path for short utterances", () => {
+  assert.equal(needsAudioWake("re"), true);
+  assert.equal(needsAudioWake("sol sostenido"), true);
+  assert.equal(needsAudioWake("aire seco y estable"), false);
 });
 
 test("keeps analysis read-only and apply scoped to the repository contract", () => {

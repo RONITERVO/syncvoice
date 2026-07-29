@@ -5,6 +5,11 @@ export const TTS_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 export const SAMPLE_RATE = 24_000;
 const TRIGGER_CHUNK_MS = 100;
 const MAX_TRIGGER_MS = 10_000;
+const TEXT_WAKE_FALLBACK_MS = 4_000;
+
+export function needsAudioWake(text) {
+  return (String(text).trim().match(/\S+/g) || []).length <= 3;
+}
 
 function instruction(entry) {
   const spokenText = /[.!?…:]$/.test(entry.text.trim()) ? entry.text : `${entry.text}.`;
@@ -48,11 +53,15 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}
   let cueEndSample = 0;
   let session;
   let triggerCancelled = false;
+  let triggerStarted = false;
+  let textWakeFallback;
+  let wakeMode = "text";
+  let noAudioTurnCompletions = 0;
 
   return new Promise(async (resolve, reject) => {
     let settled = false;
     const timeout = setTimeout(() => finishError(new Error("Audio generation timed out.")), timeoutMs);
-    function cleanup() { clearTimeout(timeout); triggerCancelled = true; try { session?.close(); } catch {} }
+    function cleanup() { clearTimeout(timeout); clearTimeout(textWakeFallback); triggerCancelled = true; try { session?.close(); } catch {} }
     function finishError(error) { if (settled) return; settled = true; cleanup(); reject(error); }
     function addTranscript(fragment) {
       const normalized = fragment.replace(/\s+/g, " ").trim();
@@ -76,7 +85,26 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}
         transcript = entry.text;
       }
       settled = true; cleanup();
-      resolve({ wav: wavBuffer(pcm), transcript, cues, durationMs: Math.round(pcm.length / SAMPLE_RATE * 1_000) });
+      resolve({ wav: wavBuffer(pcm), transcript, cues, durationMs: Math.round(pcm.length / SAMPLE_RATE * 1_000), wakeMode });
+    }
+    function startAudioWake(isFallback = false) {
+      if (settled || triggerStarted) return;
+      triggerStarted = true;
+      clearTimeout(textWakeFallback);
+      wakeMode = isFallback ? "audio-fallback" : "audio";
+      if (isFallback && !totalSamples) { transcript = ""; cues.length = 0; cueEndSample = 0; }
+      const chunkBytes = Math.floor(TRIGGER_SAMPLE_RATE * TRIGGER_CHUNK_MS / 1_000) * 2;
+      void (async () => {
+        const startedAt = Date.now(); let offset = 0;
+        while (!triggerCancelled && Date.now() - startedAt < MAX_TRIGGER_MS) {
+          const chunk = offset < TRIGGER_AUDIO_PCM.length
+            ? TRIGGER_AUDIO_PCM.subarray(offset, Math.min(TRIGGER_AUDIO_PCM.length, offset + chunkBytes))
+            : Buffer.alloc(chunkBytes);
+          offset += chunk.length;
+          session.sendRealtimeInput({ audio: { mimeType: `audio/pcm;rate=${TRIGGER_SAMPLE_RATE}`, data: chunk.toString("base64") } });
+          await new Promise(resolveDelay => setTimeout(resolveDelay, TRIGGER_CHUNK_MS));
+        }
+      })().catch(error => finishError(error instanceof Error ? error : new Error(String(error))));
     }
     try {
       const ai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: "v1alpha" } });
@@ -91,27 +119,27 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}
               const bytes = Buffer.from(part.inlineData.data, "base64");
               const pcm = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2)).slice();
               chunks.push(pcm); totalSamples += pcm.length;
+              clearTimeout(textWakeFallback);
             }
             const fragment = message.serverContent?.outputTranscription?.text;
             if (fragment) addTranscript(fragment);
-            if (message.serverContent?.turnComplete) finishSuccess();
+            if (message.serverContent?.turnComplete) {
+              if (!totalSamples) {
+                noAudioTurnCompletions += 1;
+                if (!triggerStarted) startAudioWake(true);
+                else if (wakeMode === "audio" || noAudioTurnCompletions > 1) finishSuccess();
+              } else finishSuccess();
+            }
           },
           onerror: (event) => finishError(new Error(event.message || "Gemini audio connection failed.")),
           onclose: () => undefined,
         },
       });
-      const chunkBytes = Math.floor(TRIGGER_SAMPLE_RATE * TRIGGER_CHUNK_MS / 1_000) * 2;
-      void (async () => {
-        const startedAt = Date.now(); let offset = 0;
-        while (!triggerCancelled && Date.now() - startedAt < MAX_TRIGGER_MS) {
-          const chunk = offset < TRIGGER_AUDIO_PCM.length
-            ? TRIGGER_AUDIO_PCM.subarray(offset, Math.min(TRIGGER_AUDIO_PCM.length, offset + chunkBytes))
-            : Buffer.alloc(chunkBytes);
-          offset += chunk.length;
-          session.sendRealtimeInput({ audio: { mimeType: `audio/pcm;rate=${TRIGGER_SAMPLE_RATE}`, data: chunk.toString("base64") } });
-          await new Promise(resolveDelay => setTimeout(resolveDelay, TRIGGER_CHUNK_MS));
-        }
-      })().catch(error => finishError(error instanceof Error ? error : new Error(String(error))));
+      if (needsAudioWake(entry.text)) startAudioWake();
+      else {
+        session.sendClientContent({ turns: "Play the script now.", turnComplete: true });
+        textWakeFallback = setTimeout(() => startAudioWake(true), TEXT_WAKE_FALLBACK_MS);
+      }
     } catch (error) { finishError(error instanceof Error ? error : new Error(String(error))); }
   });
 }
