@@ -32,6 +32,16 @@ function safePart(value) { const clean = String(value).normalize("NFKD").replace
 function hashEntry(entry) { return crypto.createHash("sha256").update(JSON.stringify([TTS_MODEL, entry.text, entry.locale, entry.voice, entry.direction])).digest("hex"); }
 async function writeJsonAtomic(file, value) { await fs.mkdir(path.dirname(file), { recursive: true }); const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`; await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`); await fs.rename(temporary, file); }
 
+export function minimumPlausibleDurationMs(text) {
+  const words = String(text).trim().match(/\S+/g) || [];
+  const spokenCharacters = String(text).replace(/\s+/g, "").length;
+  return Math.max(250, words.length * 180, spokenCharacters * 35);
+}
+
+export function isPlausibleDuration(text, durationMs) {
+  return Number.isFinite(durationMs) && durationMs >= minimumPlausibleDurationMs(text);
+}
+
 export function characterCues(text, wordCues, durationMs) {
   const words = [...text.matchAll(/\S+/g)];
   if (!words.length) return [{ startMs: 0, endMs: durationMs, startChar: 0, endChar: text.length }];
@@ -62,27 +72,76 @@ async function writeAudio(file, wav, format) {
   }
 }
 
-function trimWav(wav, durationMs) {
-  const requestedBytes = Math.max(2, Math.floor(durationMs * 24_000 / 1_000) * 2);
-  const availableBytes = Math.max(0, wav.length - 44);
-  const dataBytes = Math.min(availableBytes, requestedBytes);
-  const trimmed = Buffer.from(wav.subarray(0, 44 + dataBytes));
-  trimmed.writeUInt32LE(36 + dataBytes, 4);
-  trimmed.writeUInt32LE(dataBytes, 40);
-  return trimmed;
+function readPcm16Wav(wav) {
+  if (!Buffer.isBuffer(wav) || wav.length < 44 || wav.toString("ascii", 0, 4) !== "RIFF" || wav.toString("ascii", 8, 12) !== "WAVE") {
+    throw new Error("Expected a PCM WAV response from Gemini.");
+  }
+  let offset = 12; let format; let data;
+  while (offset + 8 <= wav.length) {
+    const id = wav.toString("ascii", offset, offset + 4);
+    const size = wav.readUInt32LE(offset + 4);
+    const start = offset + 8; const end = Math.min(wav.length, start + size);
+    if (id === "fmt " && size >= 16) format = { encoding: wav.readUInt16LE(start), channels: wav.readUInt16LE(start + 2), sampleRate: wav.readUInt32LE(start + 4), bits: wav.readUInt16LE(start + 14) };
+    if (id === "data") data = { start, end };
+    offset = start + size + (size % 2);
+  }
+  if (!format || !data || format.encoding !== 1 || format.channels !== 1 || format.bits !== 16 || !format.sampleRate) {
+    throw new Error("Expected mono 16-bit PCM WAV audio.");
+  }
+  const samples = new Int16Array(Math.floor((data.end - data.start) / 2));
+  for (let index = 0; index < samples.length; index += 1) samples[index] = wav.readInt16LE(data.start + index * 2);
+  return { samples, sampleRate: format.sampleRate };
 }
 
-async function generateEntrySpeech(entry, apiKey) {
-  try { return await generateSpeech(entry, apiKey); }
-  catch (error) {
-    if (!/without returning audio/i.test(error instanceof Error ? error.message : String(error))) throw error;
-    const originalWordCount = entry.text.match(/\S+/g)?.length || 1;
-    const base = entry.text.trim().replace(/[.!?…:]+$/, "");
-    const padded = await generateSpeech({ ...entry, text: `${base}. ${base}.` }, apiKey);
-    if (padded.cues.length <= originalWordCount) return { ...padded, transcript: entry.text };
-    const durationMs = Math.max(120, padded.cues[originalWordCount - 1].endMs);
-    return { ...padded, wav: trimWav(padded.wav, durationMs), durationMs, cues: padded.cues.slice(0, originalWordCount), transcript: entry.text };
+function wavFromPcm16(samples, sampleRate) {
+  const wav = Buffer.allocUnsafe(44 + samples.length * 2);
+  wav.write("RIFF", 0); wav.writeUInt32LE(36 + samples.length * 2, 4); wav.write("WAVE", 8); wav.write("fmt ", 12);
+  wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22); wav.writeUInt32LE(sampleRate, 24);
+  wav.writeUInt32LE(sampleRate * 2, 28); wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write("data", 36); wav.writeUInt32LE(samples.length * 2, 40);
+  for (let index = 0; index < samples.length; index += 1) wav.writeInt16LE(samples[index], 44 + index * 2);
+  return wav;
+}
+
+export function trimOuterSilence(wav, text) {
+  const { samples, sampleRate } = readPcm16Wav(wav);
+  const frameSamples = Math.max(1, Math.round(sampleRate * 0.01));
+  const rms = [];
+  for (let start = 0; start < samples.length; start += frameSamples) {
+    const end = Math.min(samples.length, start + frameSamples); let energy = 0;
+    for (let index = start; index < end; index += 1) energy += samples[index] * samples[index];
+    rms.push(Math.sqrt(energy / Math.max(1, end - start)));
   }
+  const peak = Math.max(0, ...rms);
+  if (peak < 200) return null;
+  const threshold = Math.max(180, peak * 0.08);
+  const firstVoicedFrame = rms.findIndex(value => value >= threshold);
+  let lastVoicedFrame = -1;
+  for (let frame = rms.length - 1; frame >= 0; frame -= 1) {
+    if (rms[frame] >= threshold) { lastVoicedFrame = frame; break; }
+  }
+  if (firstVoicedFrame < 0 || lastVoicedFrame < firstVoicedFrame) return null;
+  const paddingSamples = Math.round(sampleRate * 0.08);
+  const startSample = Math.max(0, firstVoicedFrame * frameSamples - paddingSamples);
+  const endSample = Math.min(samples.length, (lastVoicedFrame + 1) * frameSamples + paddingSamples);
+  const take = samples.slice(startSample, endSample);
+  const durationMs = Math.round(take.length / sampleRate * 1_000);
+  if (!isPlausibleDuration(text, durationMs)) return null;
+  return { wav: wavFromPcm16(take, sampleRate), durationMs };
+}
+
+export async function generateEntrySpeech(entry, apiKey) {
+  const generated = await generateSpeech(entry, apiKey);
+  if (!isPlausibleDuration(entry.text, generated.durationMs)) throw new Error("Gemini returned implausibly short audio.");
+  const words = entry.text.match(/\S+/g) || [];
+  if (words.length > 3) return generated;
+  const trimmed = trimOuterSilence(generated.wav, entry.text);
+  if (!trimmed) throw new Error("Gemini audio did not contain a complete voiced utterance.");
+  const cues = words.map((word, index) => ({
+    word,
+    startMs: Math.round(trimmed.durationMs * index / Math.max(1, words.length)),
+    endMs: Math.round(trimmed.durationMs * (index + 1) / Math.max(1, words.length)),
+  }));
+  return { ...generated, ...trimmed, transcript: entry.text, cues };
 }
 
 async function acquireGenerationLock(root) {
@@ -118,7 +177,7 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
   const checkpointState = () => (checkpoint = checkpoint.then(() => writeJsonAtomic(statePath, state)));
   const pending = project.entries.filter((entry) => {
     const hash = hashEntry(entry); const prior = state.entries[entry.externalId];
-    return !prior || prior.hash !== hash || !prior.audio;
+    return !prior || prior.hash !== hash || !prior.audio || !isPlausibleDuration(entry.text, Number(prior.durationMs));
   }).slice(0, Number.isFinite(limit) ? limit : undefined);
   let cursor = 0; let completed = 0; let failed = 0;
 
