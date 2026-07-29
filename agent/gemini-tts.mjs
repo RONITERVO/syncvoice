@@ -99,7 +99,12 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000, repea
       triggerStarted = true;
       clearTimeout(textWakeFallback);
       wakeMode = isFallback ? "audio-fallback" : "audio";
-      if (isFallback && !totalSamples) { transcript = ""; cues.length = 0; cueEndSample = 0; }
+      if (isFallback && !totalSamples) {
+        transcript = "";
+        transcriptObserved = false;
+        cues.length = 0;
+        cueEndSample = 0;
+      }
       const chunkBytes = Math.floor(TRIGGER_SAMPLE_RATE * TRIGGER_CHUNK_MS / 1_000) * 2;
       void (async () => {
         const startedAt = Date.now(); let offset = 0;

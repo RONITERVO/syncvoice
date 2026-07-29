@@ -86,12 +86,15 @@ export function shortTranscriptMatches(expected, actual) {
 export function characterCues(text, wordCues, durationMs) {
   const words = [...text.matchAll(/\S+/g)];
   if (!words.length) return [{ startMs: 0, endMs: durationMs, startChar: 0, endChar: text.length }];
-  const cues = words.map((match, index) => ({
-    startMs: Math.round(durationMs * index / words.length),
-    endMs: Math.round(durationMs * (index + 1) / words.length),
-    startChar: index === 0 ? 0 : match.index,
-    endChar: index + 1 < words.length ? words[index + 1].index : text.length,
-  }));
+  const cues = words.map((match, index) => {
+    const timed = wordCues.length === words.length ? wordCues[index] : null;
+    return {
+      startMs: timed ? Math.max(0, Math.min(durationMs, timed.startMs)) : Math.round(durationMs * index / words.length),
+      endMs: timed ? Math.max(0, Math.min(durationMs, timed.endMs)) : Math.round(durationMs * (index + 1) / words.length),
+      startChar: index === 0 ? 0 : match.index,
+      endChar: index + 1 < words.length ? words[index + 1].index : text.length,
+    };
+  });
   return cues.map((cue, index) => ({ ...cue, startChar: index === 0 ? 0 : cues[index - 1].endChar, endMs: Math.max(cue.startMs, cue.endMs) }));
 }
 
@@ -295,6 +298,23 @@ export async function generateEntrySpeech(entry, apiKey) {
   return { ...recoverySource, ...recovered, transcript: entry.text, cues, wakeMode: "audio-bounded-recovery" };
 }
 
+async function normalizeSelectedCues(entries, assetRoot, audioFormat, flatPaths) {
+  let changed = 0;
+  for (const entry of entries) {
+    const { transcriptRelative } = assetLocations(entry, audioFormat, flatPaths);
+    const transcriptPath = path.join(assetRoot, transcriptRelative);
+    const transcript = JSON.parse(await fs.readFile(transcriptPath, "utf8"));
+    if (transcript.externalId !== entry.externalId || transcript.text !== entry.text || !Number.isFinite(transcript.durationMs) || transcript.durationMs <= 0) {
+      throw new Error(`${entry.externalId}: transcript identity or duration is invalid.`);
+    }
+    const cues = characterCues(entry.text, [], transcript.durationMs);
+    if (JSON.stringify(transcript.cues) === JSON.stringify(cues)) continue;
+    await writeJsonAtomic(transcriptPath, { ...transcript, cues });
+    changed += 1;
+  }
+  return changed;
+}
+
 async function acquireGenerationLock(root) {
   const lockPath = path.join(root, ".syncvoice", "generation.lock");
   await fs.mkdir(path.dirname(lockPath), { recursive: true });
@@ -309,7 +329,7 @@ async function acquireGenerationLock(root) {
   }
 }
 
-export async function generateManifest({ manifestPath, envPath, limit = Infinity, concurrency = 4, locales, assetRootOverride, signal, onProgress = console.log }) {
+export async function generateManifest({ manifestPath, envPath, limit = Infinity, concurrency = 4, locales, assetRootOverride, normalizeCues = false, signal, onProgress = console.log }) {
   const absoluteManifest = path.resolve(manifestPath);
   const root = path.resolve(path.dirname(absoluteManifest), "..");
   const lock = await acquireGenerationLock(root);
@@ -365,8 +385,9 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
       ? { ...entry, ...prior }
       : null;
   }))).filter(Boolean);
+  const normalized = normalizeCues ? await normalizeSelectedCues(runtimeEntries, assetRoot, audioFormat, flatPaths) : 0;
   await writeJsonAtomic(path.join(assetRoot, "manifest.json"), { version: 1, project: project.project, model: TTS_MODEL, generatedAt: new Date().toISOString(), entries: runtimeEntries });
-  return { discovered: project.entries.length, selected: selectedEntries.length, pending: pending.length, completed, failed, ready: runtimeEntries.length, paused: Boolean(signal?.aborted), assetRoot };
+  return { discovered: project.entries.length, selected: selectedEntries.length, pending: pending.length, completed, failed, ready: runtimeEntries.length, normalized, paused: Boolean(signal?.aborted), assetRoot };
   } finally {
     await lock.handle.close().catch(() => undefined);
     await fs.rm(lock.lockPath, { force: true });
@@ -375,8 +396,8 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
 
 if (import.meta.url === `file://${process.argv[1].replaceAll("\\", "/")}` || process.argv[1]?.endsWith("generate.mjs")) {
   const args = argsOf(process.argv.slice(2));
-  if (!args.manifest) { console.error("Usage: node agent/generate.mjs --manifest <.syncvoice/project.json> [--env <.env>] [--locale en-US,fi-FI] [--asset-root <path>] [--limit N] [--concurrency N]"); process.exit(2); }
-  generateManifest({ manifestPath: args.manifest, envPath: args.env, locales: args.locale, assetRootOverride: args["asset-root"], limit: args.limit ? Number(args.limit) : Infinity, concurrency: args.concurrency ? Number(args.concurrency) : 4, onProgress: (event) => console.log(JSON.stringify(event)) })
+  if (!args.manifest) { console.error("Usage: node agent/generate.mjs --manifest <.syncvoice/project.json> [--env <.env>] [--locale en-US,fi-FI] [--asset-root <path>] [--normalize-cues] [--limit N] [--concurrency N]"); process.exit(2); }
+  generateManifest({ manifestPath: args.manifest, envPath: args.env, locales: args.locale, assetRootOverride: args["asset-root"], normalizeCues: args["normalize-cues"] === true, limit: args.limit ? Number(args.limit) : Infinity, concurrency: args.concurrency ? Number(args.concurrency) : 4, onProgress: (event) => console.log(JSON.stringify(event)) })
     .then((result) => console.log(JSON.stringify({ type: "complete", ...result })))
     .catch((error) => { console.error(error instanceof Error ? error.stack : String(error)); process.exit(1); });
 }

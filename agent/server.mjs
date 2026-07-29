@@ -61,10 +61,11 @@ async function startJob(job) {
       const generated = await generateManifest({
         manifestPath: path.join(root, ".syncvoice", "project.json"), envPath: job.envPath,
         locales: job.generationLocales, assetRootOverride: job.assetRoot,
-        concurrency: job.concurrency, signal: job.controller.signal,
+        normalizeCues: job.normalizeCues, concurrency: job.concurrency, signal: job.controller.signal,
         onProgress(event) { onEvent({ type: event.type, message: event.type === "generated" ? `Generated ${event.completed} of ${event.total}: ${event.id}` : `Could not generate ${event.id}: ${event.error || "unknown error"}` }); },
       });
-      job.output = { workspace: root, result: { status: generated.paused ? "needs_attention" : generated.failed ? "needs_attention" : "completed", summary: generated.paused ? `Generation paused safely with ${generated.ready.toLocaleString()} assets ready.` : `Generation finished with ${generated.ready.toLocaleString()} assets ready and ${generated.failed.toLocaleString()} failures.`, entriesDiscovered: generated.selected, filesChanged: [path.join(generated.assetRoot, "audio"), path.join(generated.assetRoot, "transcripts"), path.join(generated.assetRoot, "manifest.json")], warnings: generated.failed ? [`${generated.failed} entries need retry.`] : [], nextActions: generated.paused ? ["Start Generate assets again to resume pending entries."] : ["Run the repository asset-completeness validator against this asset root."] } };
+      const timingSummary = job.normalizeCues ? ` ${generated.normalized.toLocaleString()} transcript files were normalized without changing audio.` : " Natural Gemini-observed cue timing was preserved.";
+      job.output = { workspace: root, result: { status: generated.paused ? "needs_attention" : generated.failed ? "needs_attention" : "completed", summary: generated.paused ? `Generation paused safely with ${generated.ready.toLocaleString()} assets ready.` : `Generation finished with ${generated.ready.toLocaleString()} assets ready and ${generated.failed.toLocaleString()} failures.${timingSummary}`, entriesDiscovered: generated.selected, filesChanged: [path.join(generated.assetRoot, "audio"), path.join(generated.assetRoot, "transcripts"), path.join(generated.assetRoot, "manifest.json")], warnings: generated.failed ? [`${generated.failed} entries need retry.`] : [], nextActions: generated.paused ? ["Start Generate assets again to resume pending entries."] : ["Run the repository asset-completeness validator against this asset root."] } };
       job.status = generated.paused ? "cancelled" : "completed";
     } else {
       job.output = await runProductionAgent({ mode: job.mode, workspace: job.workspace, mission: job.mission, allowDirty: job.allowDirty, signal: job.controller.signal, onEvent });
@@ -100,7 +101,7 @@ const server = http.createServer(async (request, response) => {
       const body = await readJson(request);
       if (!new Set(["plan", "apply", "generate"]).has(body.mode)) return send(request, response, 400, { error: "Mode must be plan, apply, or generate." });
       const now = Date.now();
-      const job = { id: crypto.randomUUID(), status: "queued", mode: body.mode, workspace: String(body.workspace || ""), mission: String(body.mission || "").slice(0, 8_000), envPath: String(body.envPath || ""), generationLocales: String(body.generationLocales || "").slice(0, 500), assetRoot: String(body.assetRoot || "").slice(0, 4_000), concurrency: Math.max(1, Math.min(8, Number(body.concurrency) || 4)), allowDirty: body.allowDirty === true, controller: new AbortController(), createdAt: now, updatedAt: now, events: [], output: null, error: null };
+      const job = { id: crypto.randomUUID(), status: "queued", mode: body.mode, workspace: String(body.workspace || ""), mission: String(body.mission || "").slice(0, 8_000), envPath: String(body.envPath || ""), generationLocales: String(body.generationLocales || "").slice(0, 500), assetRoot: String(body.assetRoot || "").slice(0, 4_000), normalizeCues: body.normalizeCues === true, concurrency: Math.max(1, Math.min(8, Number(body.concurrency) || 4)), allowDirty: body.allowDirty === true, controller: new AbortController(), createdAt: now, updatedAt: now, events: [], output: null, error: null };
       jobs.set(job.id, job);
       void startJob(job);
       return send(request, response, 202, publicJob(job));

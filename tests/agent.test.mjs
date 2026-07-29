@@ -56,7 +56,7 @@ test("keeps analysis read-only and apply scoped to the repository contract", () 
   assert.match(apply, /\.syncvoice[\\/]project\.json/);
 });
 
-test("normalizes word timing into complete contiguous character cues", () => {
+test("preserves observed word timing in complete character cues", () => {
   const text = "Hola, mundo feliz.";
   const cues = characterCues(text, [
     { word: "Hola,", startMs: 0, endMs: 300 },
@@ -64,8 +64,13 @@ test("normalizes word timing into complete contiguous character cues", () => {
     { word: "feliz.", startMs: 700, endMs: 1000 },
   ], 1000);
   assert.deepEqual(cues.map(({ startChar, endChar }) => [startChar, endChar]), [[0, 6], [6, 12], [12, text.length]]);
-  assert.deepEqual(cues.map(({ startMs, endMs }) => [startMs, endMs]), [[0, 333], [333, 667], [667, 1000]]);
+  assert.deepEqual(cues.map(({ startMs, endMs }) => [startMs, endMs]), [[0, 300], [300, 700], [700, 1000]]);
   assert.equal(cues.at(-1).endMs, 1000);
+});
+
+test("normalizes word timing only when observed cues are omitted", () => {
+  const cues = characterCues("uno dos tres", [], 1_000);
+  assert.deepEqual(cues.map(({ startMs, endMs }) => [startMs, endMs]), [[0, 333], [333, 667], [667, 1000]]);
 });
 
 test("rejects transcript durations that cannot contain the requested speech", () => {

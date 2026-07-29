@@ -136,6 +136,15 @@ function createCaptionCues(wordCues: WordCue[], wordsPerCaption: number, delayMs
   }));
 }
 
+function normalizeWordCueTiming(wordCues: WordCue[], totalSamples: number) {
+  if (!wordCues.length || totalSamples <= 0) return wordCues;
+  return wordCues.map((cue, index) => ({
+    ...cue,
+    startSample: Math.round((totalSamples * index) / wordCues.length),
+    endSample: Math.round((totalSamples * (index + 1)) / wordCues.length),
+  }));
+}
+
 function createWebVtt(captions: CaptionCue[]) {
   return `WEBVTT\n\n${captions.map((caption, index) => `${index + 1}\n${formatCaptionTime(caption.startSeconds, ".")} --> ${formatCaptionTime(caption.endSeconds, ".")}\n${caption.text}`).join("\n\n")}\n`;
 }
@@ -161,6 +170,12 @@ function readStoredNumber(key: string, fallback: number, minimum: number, maximu
   return Number.isFinite(value) && value >= minimum && value <= maximum ? value : fallback;
 }
 
+function readStoredBoolean(key: string, fallback = false) {
+  if (typeof window === "undefined") return fallback;
+  const raw = window.localStorage.getItem(key);
+  return raw === null ? fallback : raw === "true";
+}
+
 export function TtsStudio() {
   const [text, setText] = useState(DEFAULT_TEXT);
   const [voice, setVoice] = useState("Kore");
@@ -169,6 +184,7 @@ export function TtsStudio() {
   const [transcript, setTranscript] = useState("");
   const [cues, setCues] = useState<WordCue[]>([]);
   const cuesRef = useRef<WordCue[]>([]);
+  const observedCuesRef = useRef<WordCue[]>([]);
   const transcriptRef = useRef("");
   const [activeCue, setActiveCue] = useState(-1);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -178,6 +194,7 @@ export function TtsStudio() {
   const [speed, setSpeed] = useState(1);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [highlightDelayMs, setHighlightDelayMs] = useState(() => readStoredNumber("syncvoice-highlight-delay-ms", 0, -2_000, 2_000));
+  const [normalizeTranscriptTiming, setNormalizeTranscriptTiming] = useState(() => readStoredBoolean("syncvoice-normalize-transcript-timing"));
   const [captionWords, setCaptionWords] = useState(() => readStoredNumber("syncvoice-caption-words", 6, 3, 12));
   const [isExporting, setIsExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -210,10 +227,20 @@ export function TtsStudio() {
     setHighlightDelayMs(clamped);
   }, []);
 
+  const changeNormalizeTranscriptTiming = useCallback((enabled: boolean) => {
+    setNormalizeTranscriptTiming(enabled);
+    const observed = observedCuesRef.current;
+    if (!generatedPcmRef.current?.length || !observed.length) return;
+    const nextCues = enabled ? normalizeWordCueTiming(observed, generatedPcmRef.current.length) : observed;
+    cuesRef.current = nextCues;
+    setCues(nextCues);
+  }, []);
+
   useEffect(() => {
     window.localStorage.setItem("syncvoice-highlight-delay-ms", String(highlightDelayMs));
     window.localStorage.setItem("syncvoice-caption-words", String(captionWords));
-  }, [captionWords, highlightDelayMs]);
+    window.localStorage.setItem("syncvoice-normalize-transcript-timing", String(normalizeTranscriptTiming));
+  }, [captionWords, highlightDelayMs, normalizeTranscriptTiming]);
 
   const revokeAudioUrl = useCallback(() => {
     if (currentAudioUrlRef.current) URL.revokeObjectURL(currentAudioUrlRef.current);
@@ -293,8 +320,9 @@ export function TtsStudio() {
       endSample: Math.round(startSample + (span * (index + 1)) / tokens.length),
     }));
     cueEndSampleRef.current = endSample;
-    cuesRef.current = [...cuesRef.current, ...nextCues];
-    setCues(cuesRef.current);
+    observedCuesRef.current = [...observedCuesRef.current, ...nextCues];
+    cuesRef.current = observedCuesRef.current;
+    setCues(observedCuesRef.current);
   }, []);
 
   const scheduleAudio = useCallback((pcm: Int16Array) => {
@@ -335,9 +363,15 @@ export function TtsStudio() {
         endSample: Math.round((merged.length * (index + 1)) / Math.max(fallbackWords.length, 1)),
       }));
       transcriptRef.current = inputText;
+      observedCuesRef.current = fallbackCues;
       cuesRef.current = fallbackCues;
       setTranscript(inputText);
       setCues(fallbackCues);
+    }
+    if (normalizeTranscriptTiming && cuesRef.current.length) {
+      const normalizedCues = normalizeWordCueTiming(observedCuesRef.current, merged.length);
+      cuesRef.current = normalizedCues;
+      setCues(normalizedCues);
     }
     const url = URL.createObjectURL(pcmToWavBlob(merged));
     generatedPcmRef.current = merged;
@@ -355,7 +389,7 @@ export function TtsStudio() {
       setIsPlaying(false);
       setProgress(1);
     }, remainingMs + 40);
-  }, []);
+  }, [normalizeTranscriptTiming]);
 
   const generate = useCallback(async () => {
     const inputText = text.trim();
@@ -371,6 +405,7 @@ export function TtsStudio() {
     transcriptRef.current = "";
     setCues([]);
     cuesRef.current = [];
+    observedCuesRef.current = [];
     setActiveCue(-1);
     setProgress(0);
     setDuration(0);
@@ -639,6 +674,14 @@ export function TtsStudio() {
                 <input type="range" min="-2000" max="2000" step="25" value={highlightDelayMs} onChange={(event) => changeHighlightDelay(Number(event.target.value))} aria-label="Transcript highlight delay in milliseconds" />
                 <div className="range-labels"><span>Earlier</span><button onClick={() => changeHighlightDelay(0)}>Reset</button><span>Later</span></div>
               </div>
+            </div>
+
+            <div className="advanced-setting">
+              <div className="setting-copy">
+                <strong>Normalize transcript timing</strong>
+                <p>Evenly pace highlights across the completed audio. Off preserves Gemini's naturally observed, slightly live-feeling timing.</p>
+              </div>
+              <label className="timing-toggle"><input type="checkbox" checked={normalizeTranscriptTiming} onChange={(event) => changeNormalizeTranscriptTiming(event.target.checked)} disabled={busy} /><span>{normalizeTranscriptTiming ? "Normalized" : "Natural timing"}</span></label>
             </div>
 
             <div className="advanced-setting">

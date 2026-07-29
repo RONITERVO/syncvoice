@@ -22,6 +22,7 @@ export function AgentPanel() {
   const [envPath, setEnvPath] = useState("");
   const [generationLocales, setGenerationLocales] = useState("");
   const [assetRoot, setAssetRoot] = useState("");
+  const [normalizeCues, setNormalizeCues] = useState(false);
   const [mission, setMission] = useState("Discover every spoken line, prepare durable voice assets, integrate synchronized playback, and preserve the current fallback behavior.");
   const [connected, setConnected] = useState(false);
   const [job, setJob] = useState<AgentJob | null>(null);
@@ -35,6 +36,7 @@ export function AgentPanel() {
     setEnvPath(localStorage.getItem("syncvoice.agent.envPath") || "");
     setGenerationLocales(localStorage.getItem("syncvoice.agent.locales") || "");
     setAssetRoot(localStorage.getItem("syncvoice.agent.assetRoot") || "");
+    setNormalizeCues(localStorage.getItem("syncvoice.agent.normalizeCues") === "true");
     setOpen(true);
   }
 
@@ -68,7 +70,8 @@ export function AgentPanel() {
       if (envPath) localStorage.setItem("syncvoice.agent.envPath", envPath);
       localStorage.setItem("syncvoice.agent.locales", generationLocales);
       localStorage.setItem("syncvoice.agent.assetRoot", assetRoot);
-      const created = await request<AgentJob>("/jobs", { method: "POST", body: JSON.stringify({ mode, workspace, mission, envPath, generationLocales, assetRoot, concurrency: 4 }) });
+      localStorage.setItem("syncvoice.agent.normalizeCues", String(normalizeCues));
+      const created = await request<AgentJob>("/jobs", { method: "POST", body: JSON.stringify({ mode, workspace, mission, envPath, generationLocales, assetRoot, normalizeCues, concurrency: 4 }) });
       setJob(created); setConnected(true);
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not start the Production Agent."); }
     finally { setBusy(false); }
@@ -117,6 +120,7 @@ export function AgentPanel() {
                 <label>Gemini keys file <span>(generation only)</span><input value={envPath} onChange={(event) => setEnvPath(event.target.value)} placeholder="D:\secure\tts.env" /></label>
                 <label>Locales <span>(optional generation shard)</span><input value={generationLocales} onChange={(event) => setGenerationLocales(event.target.value)} placeholder="en-US,fi-FI" /></label>
                 <label>Asset output folder <span>(optional companion repository)</span><input value={assetRoot} onChange={(event) => setAssetRoot(event.target.value)} placeholder="D:\Projects\MyGame-audio\assets\syncvoice" /></label>
+                <label className="agent-check"><input type="checkbox" checked={normalizeCues} onChange={(event) => setNormalizeCues(event.target.checked)} /><span><strong>Normalize transcript timing</strong><small>Opt in to even full-duration cue pacing. Leave off to preserve Gemini's naturally observed transcript timing.</small></span></label>
                 <div className="agent-actions">
                   <button onClick={() => void run("plan")} disabled={busy || job?.status === "running"}><FolderSearch2 size={16} /> Analyze safely</button>
                   <button className="agent-apply" onClick={() => void run("apply")} disabled={busy || job?.status === "running"}><Play size={16} /> Apply production plan</button>
