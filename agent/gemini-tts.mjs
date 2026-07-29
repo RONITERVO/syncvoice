@@ -1,7 +1,10 @@
 import { GoogleGenAI, Modality } from "@google/genai";
+import { TRIGGER_AUDIO_PCM, TRIGGER_SAMPLE_RATE } from "./trigger-audio.mjs";
 
 export const TTS_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025";
 export const SAMPLE_RATE = 24_000;
+const TRIGGER_CHUNK_MS = 100;
+const MAX_TRIGGER_MS = 10_000;
 
 function instruction(entry) {
   const spokenText = /[.!?…:]$/.test(entry.text.trim()) ? entry.text : `${entry.text}.`;
@@ -44,11 +47,12 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}
   let totalSamples = 0;
   let cueEndSample = 0;
   let session;
+  let triggerCancelled = false;
 
   return new Promise(async (resolve, reject) => {
     let settled = false;
     const timeout = setTimeout(() => finishError(new Error("Audio generation timed out.")), timeoutMs);
-    function cleanup() { clearTimeout(timeout); try { session?.close(); } catch {} }
+    function cleanup() { clearTimeout(timeout); triggerCancelled = true; try { session?.close(); } catch {} }
     function finishError(error) { if (settled) return; settled = true; cleanup(); reject(error); }
     function addTranscript(fragment) {
       const normalized = fragment.replace(/\s+/g, " ").trim();
@@ -96,7 +100,18 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}
           onclose: () => undefined,
         },
       });
-      session.sendClientContent({ turns: "Play the script now.", turnComplete: true });
+      const chunkBytes = Math.floor(TRIGGER_SAMPLE_RATE * TRIGGER_CHUNK_MS / 1_000) * 2;
+      void (async () => {
+        const startedAt = Date.now(); let offset = 0;
+        while (!triggerCancelled && Date.now() - startedAt < MAX_TRIGGER_MS) {
+          const chunk = offset < TRIGGER_AUDIO_PCM.length
+            ? TRIGGER_AUDIO_PCM.subarray(offset, Math.min(TRIGGER_AUDIO_PCM.length, offset + chunkBytes))
+            : Buffer.alloc(chunkBytes);
+          offset += chunk.length;
+          session.sendRealtimeInput({ audio: { mimeType: `audio/pcm;rate=${TRIGGER_SAMPLE_RATE}`, data: chunk.toString("base64") } });
+          await new Promise(resolveDelay => setTimeout(resolveDelay, TRIGGER_CHUNK_MS));
+        }
+      })().catch(error => finishError(error instanceof Error ? error : new Error(String(error))));
     } catch (error) { finishError(error instanceof Error ? error : new Error(String(error))); }
   });
 }
