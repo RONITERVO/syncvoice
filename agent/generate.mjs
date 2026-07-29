@@ -32,6 +32,15 @@ function safePart(value) { const clean = String(value).normalize("NFKD").replace
 function hashEntry(entry) { return crypto.createHash("sha256").update(JSON.stringify([TTS_MODEL, entry.text, entry.locale, entry.voice, entry.direction])).digest("hex"); }
 async function writeJsonAtomic(file, value) { await fs.mkdir(path.dirname(file), { recursive: true }); const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`; await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`); await fs.rename(temporary, file); }
 
+export function selectedManifestEntries(entries, locales) {
+  const requested = (Array.isArray(locales) ? locales : String(locales || "").split(","))
+    .map(value => String(value).trim())
+    .filter(Boolean);
+  if (!requested.length) return entries;
+  const allowed = new Set(requested);
+  return entries.filter(entry => allowed.has(entry.locale));
+}
+
 export function minimumPlausibleDurationMs(text) {
   const words = String(text).trim().match(/\S+/g) || [];
   const spokenCharacters = String(text).replace(/\s+/g, "").length;
@@ -158,7 +167,7 @@ async function acquireGenerationLock(root) {
   }
 }
 
-export async function generateManifest({ manifestPath, envPath, limit = Infinity, concurrency = 4, signal, onProgress = console.log }) {
+export async function generateManifest({ manifestPath, envPath, limit = Infinity, concurrency = 4, locales, assetRootOverride, signal, onProgress = console.log }) {
   const absoluteManifest = path.resolve(manifestPath);
   const root = path.resolve(path.dirname(absoluteManifest), "..");
   const lock = await acquireGenerationLock(root);
@@ -168,14 +177,16 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
   const env = envPath ? parseEnv(await fs.readFile(path.resolve(envPath), "utf8")) : process.env;
   const keys = [1, 2, 3, 4].map((index) => env[`GEMINI_API_KEY${index}`] || process.env[`GEMINI_API_KEY${index}`]).filter(Boolean);
   if (!keys.length) throw new Error("No GEMINI_API_KEY1…4 values were found.");
-  const assetRoot = path.resolve(root, project.project?.assetRoot || "assets/syncvoice");
+  const assetRoot = path.resolve(root, assetRootOverride || project.project?.assetRoot || "assets/syncvoice");
   const audioFormat = String(project.project?.audioFormat || "wav").toLowerCase();
   const statePath = path.join(root, ".syncvoice", "generation-state.json");
   const state = JSON.parse(await fs.readFile(statePath, "utf8").catch(() => "{\"version\":1,\"entries\":{}}"));
   state.version = 1; state.model = TTS_MODEL; state.entries ||= {};
   let checkpoint = Promise.resolve();
   const checkpointState = () => (checkpoint = checkpoint.then(() => writeJsonAtomic(statePath, state)));
-  const pending = project.entries.filter((entry) => {
+  const selectedEntries = selectedManifestEntries(project.entries, locales);
+  if (locales && !selectedEntries.length) throw new Error(`No manifest entries matched locale filter: ${String(locales)}`);
+  const pending = selectedEntries.filter((entry) => {
     const hash = hashEntry(entry); const prior = state.entries[entry.externalId];
     return !prior || prior.hash !== hash || !prior.audio || !isPlausibleDuration(entry.text, Number(prior.durationMs));
   }).slice(0, Number.isFinite(limit) ? limit : undefined);
@@ -205,9 +216,9 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
   }
   await fs.mkdir(assetRoot, { recursive: true });
   await Promise.all(Array.from({ length: Math.max(1, Math.min(Number(concurrency) || 1, keys.length, 8)) }, (_, index) => worker(index)));
-  const runtimeEntries = project.entries.map((entry) => ({ ...entry, ...(state.entries[entry.externalId] || {}) })).filter((entry) => entry.audio);
+  const runtimeEntries = selectedEntries.map((entry) => ({ ...entry, ...(state.entries[entry.externalId] || {}) })).filter((entry) => entry.audio);
   await writeJsonAtomic(path.join(assetRoot, "manifest.json"), { version: 1, project: project.project, model: TTS_MODEL, generatedAt: new Date().toISOString(), entries: runtimeEntries });
-  return { discovered: project.entries.length, pending: pending.length, completed, failed, ready: runtimeEntries.length, paused: Boolean(signal?.aborted), assetRoot };
+  return { discovered: project.entries.length, selected: selectedEntries.length, pending: pending.length, completed, failed, ready: runtimeEntries.length, paused: Boolean(signal?.aborted), assetRoot };
   } finally {
     await lock.handle.close().catch(() => undefined);
     await fs.rm(lock.lockPath, { force: true });
@@ -216,8 +227,8 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
 
 if (import.meta.url === `file://${process.argv[1].replaceAll("\\", "/")}` || process.argv[1]?.endsWith("generate.mjs")) {
   const args = argsOf(process.argv.slice(2));
-  if (!args.manifest) { console.error("Usage: node agent/generate.mjs --manifest <.syncvoice/project.json> [--env <.env>] [--limit N] [--concurrency N]"); process.exit(2); }
-  generateManifest({ manifestPath: args.manifest, envPath: args.env, limit: args.limit ? Number(args.limit) : Infinity, concurrency: args.concurrency ? Number(args.concurrency) : 4, onProgress: (event) => console.log(JSON.stringify(event)) })
+  if (!args.manifest) { console.error("Usage: node agent/generate.mjs --manifest <.syncvoice/project.json> [--env <.env>] [--locale en-US,fi-FI] [--asset-root <path>] [--limit N] [--concurrency N]"); process.exit(2); }
+  generateManifest({ manifestPath: args.manifest, envPath: args.env, locales: args.locale, assetRootOverride: args["asset-root"], limit: args.limit ? Number(args.limit) : Infinity, concurrency: args.concurrency ? Number(args.concurrency) : 4, onProgress: (event) => console.log(JSON.stringify(event)) })
     .then((result) => console.log(JSON.stringify({ type: "complete", ...result })))
     .catch((error) => { console.error(error instanceof Error ? error.stack : String(error)); process.exit(1); });
 }

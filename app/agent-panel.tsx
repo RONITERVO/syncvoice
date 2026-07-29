@@ -20,6 +20,8 @@ export function AgentPanel() {
   const [token, setToken] = useState("");
   const [workspace, setWorkspace] = useState("");
   const [envPath, setEnvPath] = useState("");
+  const [generationLocales, setGenerationLocales] = useState("");
+  const [assetRoot, setAssetRoot] = useState("");
   const [mission, setMission] = useState("Discover every spoken line, prepare durable voice assets, integrate synchronized playback, and preserve the current fallback behavior.");
   const [connected, setConnected] = useState(false);
   const [job, setJob] = useState<AgentJob | null>(null);
@@ -31,6 +33,8 @@ export function AgentPanel() {
     setToken(localStorage.getItem("syncvoice.agent.token") || "");
     setWorkspace(localStorage.getItem("syncvoice.agent.workspace") || "");
     setEnvPath(localStorage.getItem("syncvoice.agent.envPath") || "");
+    setGenerationLocales(localStorage.getItem("syncvoice.agent.locales") || "");
+    setAssetRoot(localStorage.getItem("syncvoice.agent.assetRoot") || "");
     setOpen(true);
   }
 
@@ -62,7 +66,9 @@ export function AgentPanel() {
     try {
       localStorage.setItem("syncvoice.agent.workspace", workspace);
       if (envPath) localStorage.setItem("syncvoice.agent.envPath", envPath);
-      const created = await request<AgentJob>("/jobs", { method: "POST", body: JSON.stringify({ mode, workspace, mission, envPath, concurrency: 4 }) });
+      localStorage.setItem("syncvoice.agent.locales", generationLocales);
+      localStorage.setItem("syncvoice.agent.assetRoot", assetRoot);
+      const created = await request<AgentJob>("/jobs", { method: "POST", body: JSON.stringify({ mode, workspace, mission, envPath, generationLocales, assetRoot, concurrency: 4 }) });
       setJob(created); setConnected(true);
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not start the Production Agent."); }
     finally { setBusy(false); }
@@ -109,6 +115,8 @@ export function AgentPanel() {
                 <label>Game repository<input value={workspace} onChange={(event) => setWorkspace(event.target.value)} placeholder="D:\Projects\MyGame" /></label>
                 <label>Production mission<textarea value={mission} onChange={(event) => setMission(event.target.value)} /></label>
                 <label>Gemini keys file <span>(generation only)</span><input value={envPath} onChange={(event) => setEnvPath(event.target.value)} placeholder="D:\secure\tts.env" /></label>
+                <label>Locales <span>(optional generation shard)</span><input value={generationLocales} onChange={(event) => setGenerationLocales(event.target.value)} placeholder="en-US,fi-FI" /></label>
+                <label>Asset output folder <span>(optional companion repository)</span><input value={assetRoot} onChange={(event) => setAssetRoot(event.target.value)} placeholder="D:\Projects\MyGame-audio\assets\syncvoice" /></label>
                 <div className="agent-actions">
                   <button onClick={() => void run("plan")} disabled={busy || job?.status === "running"}><FolderSearch2 size={16} /> Analyze safely</button>
                   <button className="agent-apply" onClick={() => void run("apply")} disabled={busy || job?.status === "running"}><Play size={16} /> Apply production plan</button>

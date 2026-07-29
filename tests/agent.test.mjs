@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildAgentPrompt, modelForMode } from "../agent/contract.mjs";
-import { characterCues, isPlausibleDuration, minimumPlausibleDurationMs, trimOuterSilence } from "../agent/generate.mjs";
+import { characterCues, isPlausibleDuration, minimumPlausibleDurationMs, selectedManifestEntries, trimOuterSilence } from "../agent/generate.mjs";
 import { TRIGGER_AUDIO_PCM, TRIGGER_SAMPLE_RATE } from "../agent/trigger-audio.mjs";
 import { needsAudioWake } from "../agent/gemini-tts.mjs";
 
@@ -83,4 +83,15 @@ test("trims only the outer silence around an exact short utterance", () => {
 test("does not publish audio without a voiced utterance", () => {
   const wav = syntheticWav([{ durationMs: 900, amplitude: 0 }]);
   assert.equal(trimOuterSilence(wav, "escuela"), null);
+});
+
+test("selects locale shards without changing manifest entry identity", () => {
+  const entries = [
+    { externalId: "es", locale: "es-ES" },
+    { externalId: "en", locale: "en-US" },
+    { externalId: "fi", locale: "fi-FI" },
+  ];
+  assert.equal(selectedManifestEntries(entries), entries);
+  assert.deepEqual(selectedManifestEntries(entries, "en-US,fi-FI"), entries.slice(1));
+  assert.deepEqual(selectedManifestEntries(entries, ["fi-FI"]), [entries[2]]);
 });
