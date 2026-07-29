@@ -62,6 +62,29 @@ async function writeAudio(file, wav, format) {
   }
 }
 
+function trimWav(wav, durationMs) {
+  const requestedBytes = Math.max(2, Math.floor(durationMs * 24_000 / 1_000) * 2);
+  const availableBytes = Math.max(0, wav.length - 44);
+  const dataBytes = Math.min(availableBytes, requestedBytes);
+  const trimmed = Buffer.from(wav.subarray(0, 44 + dataBytes));
+  trimmed.writeUInt32LE(36 + dataBytes, 4);
+  trimmed.writeUInt32LE(dataBytes, 40);
+  return trimmed;
+}
+
+async function generateEntrySpeech(entry, apiKey) {
+  try { return await generateSpeech(entry, apiKey); }
+  catch (error) {
+    if (!/without returning audio/i.test(error instanceof Error ? error.message : String(error))) throw error;
+    const originalWordCount = entry.text.match(/\S+/g)?.length || 1;
+    const base = entry.text.trim().replace(/[.!?…:]+$/, "");
+    const padded = await generateSpeech({ ...entry, text: `${base}. ${base}.` }, apiKey);
+    if (padded.cues.length <= originalWordCount) return { ...padded, transcript: entry.text };
+    const durationMs = Math.max(120, padded.cues[originalWordCount - 1].endMs);
+    return { ...padded, wav: trimWav(padded.wav, durationMs), durationMs, cues: padded.cues.slice(0, originalWordCount), transcript: entry.text };
+  }
+}
+
 export async function generateManifest({ manifestPath, envPath, limit = Infinity, concurrency = 4, signal, onProgress = console.log }) {
   const absoluteManifest = path.resolve(manifestPath);
   const root = path.resolve(path.dirname(absoluteManifest), "..");
@@ -95,7 +118,7 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
       for (let attempt = 1; attempt <= 4; attempt += 1) {
         if (signal?.aborted) break;
         try {
-          const generated = await generateSpeech(entry, keys[(workerIndex + attempt - 1) % keys.length]);
+          const generated = await generateEntrySpeech(entry, keys[(workerIndex + attempt - 1) % keys.length]);
           await writeAudio(audioPath, generated.wav, audioFormat);
           await writeJsonAtomic(transcriptPath, { version: 1, externalId: entry.externalId, text: entry.text, durationMs: generated.durationMs, cues: characterCues(entry.text, generated.cues, generated.durationMs) });
           state.entries[entry.externalId] = { hash, audio: audioRelative.replaceAll("\\", "/"), transcript: transcriptRelative.replaceAll("\\", "/"), durationMs: generated.durationMs, generatedAt: new Date().toISOString() };
