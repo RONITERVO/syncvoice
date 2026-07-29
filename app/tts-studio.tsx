@@ -7,9 +7,13 @@ import {
   ChevronDown,
   Clock3,
   Download,
+  FileArchive,
+  Minus,
   Pause,
   Play,
+  Plus,
   RotateCcw,
+  Settings2,
   Sparkles,
   Square,
   WandSparkles,
@@ -33,6 +37,7 @@ const VOICES = [
 
 type StudioState = "idle" | "connecting" | "generating" | "ready" | "error";
 type WordCue = { id: number; text: string; startSample: number; endSample: number };
+type CaptionCue = { startSeconds: number; endSeconds: number; text: string };
 
 function decodePcm(base64: string) {
   const binary = atob(base64);
@@ -103,6 +108,59 @@ function appendTranscript(previous: string, fragment: string) {
   return `${previous} ${normalized}`;
 }
 
+function formatCaptionTime(seconds: number, decimalMark: "." | ",") {
+  const milliseconds = Math.max(0, Math.round(seconds * 1_000));
+  const hours = Math.floor(milliseconds / 3_600_000);
+  const minutes = Math.floor((milliseconds % 3_600_000) / 60_000);
+  const secs = Math.floor((milliseconds % 60_000) / 1_000);
+  const millis = milliseconds % 1_000;
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}${decimalMark}${String(millis).padStart(3, "0")}`;
+}
+
+function createCaptionCues(wordCues: WordCue[], wordsPerCaption: number, delayMs: number): CaptionCue[] {
+  const groups: WordCue[][] = [];
+  let current: WordCue[] = [];
+  for (const cue of wordCues) {
+    current.push(cue);
+    if (current.length >= wordsPerCaption || /[.!?][\]"')]*$/.test(cue.text)) {
+      groups.push(current);
+      current = [];
+    }
+  }
+  if (current.length) groups.push(current);
+  const delaySeconds = delayMs / 1_000;
+  return groups.map((group) => ({
+    startSeconds: Math.max(0, group[0].startSample / SAMPLE_RATE + delaySeconds),
+    endSeconds: Math.max(0.08, group[group.length - 1].endSample / SAMPLE_RATE + delaySeconds),
+    text: group.map((cue) => cue.text).join(" "),
+  }));
+}
+
+function createWebVtt(captions: CaptionCue[]) {
+  return `WEBVTT\n\n${captions.map((caption, index) => `${index + 1}\n${formatCaptionTime(caption.startSeconds, ".")} --> ${formatCaptionTime(caption.endSeconds, ".")}\n${caption.text}`).join("\n\n")}\n`;
+}
+
+function createSrt(captions: CaptionCue[]) {
+  return `${captions.map((caption, index) => `${index + 1}\n${formatCaptionTime(caption.startSeconds, ",")} --> ${formatCaptionTime(caption.endSeconds, ",")}\n${caption.text}`).join("\n\n")}\n`;
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+}
+
+function readStoredNumber(key: string, fallback: number, minimum: number, maximum: number) {
+  if (typeof window === "undefined") return fallback;
+  const raw = window.localStorage.getItem(key);
+  if (raw === null) return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= minimum && value <= maximum ? value : fallback;
+}
+
 export function TtsStudio() {
   const [text, setText] = useState(DEFAULT_TEXT);
   const [voice, setVoice] = useState("Kore");
@@ -118,6 +176,10 @@ export function TtsStudio() {
   const [progress, setProgress] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [highlightDelayMs, setHighlightDelayMs] = useState(() => readStoredNumber("syncvoice-highlight-delay-ms", 0, -2_000, 2_000));
+  const [captionWords, setCaptionWords] = useState(() => readStoredNumber("syncvoice-caption-words", 6, 3, 12));
+  const [isExporting, setIsExporting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [waveform, setWaveform] = useState(() => createWaveform(null));
 
@@ -125,6 +187,7 @@ export function TtsStudio() {
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const audioChunksRef = useRef<Int16Array[]>([]);
+  const generatedPcmRef = useRef<Int16Array | null>(null);
   const audioSamplesRef = useRef(0);
   const cueEndSampleRef = useRef(0);
   const cueIdRef = useRef(0);
@@ -134,11 +197,23 @@ export function TtsStudio() {
   const animationRef = useRef<number | null>(null);
   const generationRef = useRef(0);
   const currentAudioUrlRef = useRef<string | null>(null);
+  const highlightDelayRef = useRef(highlightDelayMs);
 
   const selectedVoice = VOICES.find((item) => item.id === voice) ?? VOICES[0];
   const words = useMemo(() => text.trim().split(/\s+/).filter(Boolean).length, [text]);
   const estimate = Math.max(1, Math.round(words / 2.45));
   const busy = state === "connecting" || state === "generating";
+
+  const changeHighlightDelay = useCallback((nextDelay: number) => {
+    const clamped = Math.max(-2_000, Math.min(2_000, Math.round(nextDelay / 25) * 25));
+    highlightDelayRef.current = clamped;
+    setHighlightDelayMs(clamped);
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("syncvoice-highlight-delay-ms", String(highlightDelayMs));
+    window.localStorage.setItem("syncvoice-caption-words", String(captionWords));
+  }, [captionWords, highlightDelayMs]);
 
   const revokeAudioUrl = useCallback(() => {
     if (currentAudioUrlRef.current) URL.revokeObjectURL(currentAudioUrlRef.current);
@@ -169,9 +244,10 @@ export function TtsStudio() {
     setActiveCue((current) => {
       let next = -1;
       const currentCues = cuesRef.current;
+      const adjustedSample = sample - (highlightDelayRef.current / 1_000) * SAMPLE_RATE;
       for (let index = 0; index < currentCues.length; index += 1) {
-        if (sample >= currentCues[index].startSample) next = index;
-        if (sample < currentCues[index].endSample) break;
+        if (adjustedSample >= currentCues[index].startSample) next = index;
+        if (adjustedSample < currentCues[index].endSample) break;
       }
       return next === current ? current : next;
     });
@@ -264,6 +340,7 @@ export function TtsStudio() {
       setCues(fallbackCues);
     }
     const url = URL.createObjectURL(pcmToWavBlob(merged));
+    generatedPcmRef.current = merged;
     currentAudioUrlRef.current = url;
     setAudioUrl(url);
     setDuration(merged.length / SAMPLE_RATE);
@@ -300,6 +377,7 @@ export function TtsStudio() {
     setIsPlaying(false);
     setWaveform(createWaveform(null));
     audioChunksRef.current = [];
+    generatedPcmRef.current = null;
     audioSamplesRef.current = 0;
     cueEndSampleRef.current = 0;
     cueIdRef.current = 0;
@@ -431,6 +509,47 @@ export function TtsStudio() {
     if (audioElementRef.current) audioElementRef.current.playbackRate = nextSpeed;
   }, []);
 
+  const exportSyncedPackage = useCallback(async () => {
+    const pcm = generatedPcmRef.current;
+    const wordCues = cuesRef.current;
+    if (!pcm?.length || !wordCues.length || isExporting) return;
+    setIsExporting(true);
+    try {
+      const { default: JSZip } = await import("jszip");
+      const captions = createCaptionCues(wordCues, captionWords, highlightDelayMs);
+      const adjustedWordCues = wordCues.map((cue) => ({
+        word: cue.text,
+        startMs: Math.max(0, Math.round((cue.startSample / SAMPLE_RATE) * 1_000 + highlightDelayMs)),
+        endMs: Math.max(80, Math.round((cue.endSample / SAMPLE_RATE) * 1_000 + highlightDelayMs)),
+      }));
+      const zip = new JSZip();
+      zip.file("syncvoice.wav", pcmToWavBlob(pcm));
+      zip.file("syncvoice.vtt", createWebVtt(captions));
+      zip.file("syncvoice.srt", createSrt(captions));
+      zip.file("syncvoice.json", JSON.stringify({
+        format: "syncvoice-timed-audio",
+        version: 1,
+        model: "gemini-2.5-flash-native-audio-preview-12-2025",
+        voice,
+        sampleRate: SAMPLE_RATE,
+        durationMs: Math.round(duration * 1_000),
+        transcript,
+        highlightDelayMs,
+        words: adjustedWordCues,
+        captions: captions.map((caption) => ({
+          startMs: Math.round(caption.startSeconds * 1_000),
+          endMs: Math.round(caption.endSeconds * 1_000),
+          text: caption.text,
+        })),
+      }, null, 2));
+      zip.file("README.txt", "SyncVoice synchronized media package\n\nUse syncvoice.wav as the audio track. Import syncvoice.vtt or syncvoice.srt as the matching subtitle/caption track in a compatible player or editor. syncvoice.json contains word-level millisecond timing for custom apps.\n");
+      const archive = await zip.generateAsync({ type: "blob", compression: "DEFLATE", compressionOptions: { level: 6 } });
+      downloadBlob(archive, "syncvoice-synced-media.zip");
+    } finally {
+      setIsExporting(false);
+    }
+  }, [captionWords, duration, highlightDelayMs, isExporting, transcript, voice]);
+
   useEffect(() => () => {
     generationRef.current += 1;
     void stopPlaybackInfrastructure();
@@ -498,6 +617,42 @@ export function TtsStudio() {
             {busy ? <><span className="spinner" /> Generating</> : <><WandSparkles size={19} /> Generate voice</>}
           </button>
         </div>
+
+        <button className="advanced-toggle" onClick={() => setAdvancedOpen((open) => !open)} aria-expanded={advancedOpen} aria-controls="advanced-settings">
+          <span><Settings2 size={15} /> Advanced settings</span>
+          <ChevronDown size={16} className={advancedOpen ? "open" : ""} />
+        </button>
+
+        {advancedOpen && (
+          <div className="advanced-panel" id="advanced-settings">
+            <div className="advanced-setting delay-setting">
+              <div className="setting-copy">
+                <strong>Transcript highlight delay</strong>
+                <p>Move the active word earlier or later until it lands exactly on the voice.</p>
+              </div>
+              <div className="delay-control">
+                <div className="delay-actions">
+                  <button onClick={() => changeHighlightDelay(highlightDelayMs - 50)} aria-label="Move transcript highlight 50 milliseconds earlier"><Minus size={15} /></button>
+                  <output aria-live="polite" className={highlightDelayMs === 0 ? "neutral" : ""}>{highlightDelayMs > 0 ? "+" : ""}{highlightDelayMs} ms</output>
+                  <button onClick={() => changeHighlightDelay(highlightDelayMs + 50)} aria-label="Move transcript highlight 50 milliseconds later"><Plus size={15} /></button>
+                </div>
+                <input type="range" min="-2000" max="2000" step="25" value={highlightDelayMs} onChange={(event) => changeHighlightDelay(Number(event.target.value))} aria-label="Transcript highlight delay in milliseconds" />
+                <div className="range-labels"><span>Earlier</span><button onClick={() => changeHighlightDelay(0)}>Reset</button><span>Later</span></div>
+              </div>
+            </div>
+
+            <div className="advanced-setting">
+              <div className="setting-copy">
+                <strong>Export caption grouping</strong>
+                <p>Choose how many words appear together in WebVTT and SRT captions.</p>
+              </div>
+              <div className="caption-group-control">
+                <input type="range" min="3" max="12" step="1" value={captionWords} onChange={(event) => setCaptionWords(Number(event.target.value))} aria-label="Words per exported caption" />
+                <output>{captionWords} words</output>
+              </div>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className={`playback-panel ${busy ? "is-live" : ""}`} aria-live="polite">
@@ -530,8 +685,15 @@ export function TtsStudio() {
           <div className="speed-control" aria-label="Playback speed">
             {[0.75, 1, 1.25].map((value) => <button key={value} onClick={() => changeSpeed(value)} className={speed === value ? "active" : ""}>{value}×</button>)}
           </div>
-          <span>24 kHz · PCM · WAV</span>
+          <div className="export-meta">
+            <span>24 kHz · PCM · WAV</span>
+            <button className="export-button" onClick={exportSyncedPackage} disabled={!audioUrl || !cues.length || isExporting}>
+              <FileArchive size={15} /> {isExporting ? "Packaging…" : "Export synced package"}
+            </button>
+          </div>
         </div>
+
+        {audioUrl && <p className="export-note">Includes WAV audio, WebVTT and SRT captions, plus word-level JSON timing.</p>}
 
         {error && <div className="error-banner" role="alert">{error}</div>}
       </section>

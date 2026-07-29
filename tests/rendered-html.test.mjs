@@ -37,9 +37,15 @@ test("keeps secrets server-side and removes the starter preview", async () => {
 
   assert.doesNotMatch(client, /GEMINI_API_KEY[1-4]/);
   assert.match(client, /fetch\("\/api\/session"/);
+  assert.match(client, /Transcript highlight delay/);
+  assert.match(client, /min="-2000" max="2000"/);
+  assert.match(client, /createWebVtt/);
+  assert.match(client, /createSrt/);
+  assert.match(client, /Export synced package/);
   assert.match(route, /GEMINI_API_KEY\$\{index\}/);
   assert.match(route, /authTokens\.create/);
   assert.match(route, /gemini-2\.5-flash-native-audio-preview-12-2025/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
+  assert.match(packageJson, /"jszip"/);
   await assert.rejects(access(new URL("../app/_sites-preview/SkeletonPreview.tsx", templateRoot)));
 });
