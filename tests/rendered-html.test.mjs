@@ -31,6 +31,7 @@ test("keeps credentials server-side and declares durable project infrastructure"
   assert.doesNotMatch(quickClient, /GEMINI_API_KEY[1-4]/);
   assert.match(quickClient, /fetch\("\/api\/session"/);
   assert.match(quickClient, /Transcript highlight delay/);
+  assert.match(quickClient, /Normalize transcript timing/);
   assert.match(quickClient, /Export synced package/);
   assert.match(sessionRoute, /GEMINI_API_KEY\$\{index\}/);
   assert.match(sessionRoute, /authTokens\.create/);

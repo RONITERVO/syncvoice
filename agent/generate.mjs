@@ -32,6 +32,40 @@ function safePart(value) { const clean = String(value).normalize("NFKD").replace
 function hashEntry(entry) { return crypto.createHash("sha256").update(JSON.stringify([TTS_MODEL, entry.text, entry.locale, entry.voice, entry.direction])).digest("hex"); }
 async function writeJsonAtomic(file, value) { await fs.mkdir(path.dirname(file), { recursive: true }); const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`; await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`); await fs.rename(temporary, file); }
 
+export function selectedManifestEntries(entries, locales) {
+  const requested = (Array.isArray(locales) ? locales : String(locales || "").split(","))
+    .map(value => String(value).trim())
+    .filter(Boolean);
+  if (!requested.length) return entries;
+  const allowed = new Set(requested);
+  return entries.filter(entry => allowed.has(entry.locale));
+}
+
+export function assetLocations(entry, audioFormat, flatPaths) {
+  const locale = safePart(entry.locale || "und");
+  const id = safePart(entry.externalId);
+  return {
+    audioRelative: flatPaths ? `audio/${id}.${audioFormat}` : `audio/${locale}/${id}.${audioFormat}`,
+    transcriptRelative: flatPaths ? `transcripts/${id}.json` : `transcripts/${locale}/${id}.json`,
+  };
+}
+
+export async function readyInAssetRoot(entry, prior, hash, assetRoot, audioFormat, flatPaths) {
+  if (!prior || prior.hash !== hash || !prior.audio || !prior.transcript || !isPlausibleDuration(entry.text, Number(prior.durationMs))) return false;
+  const expected = assetLocations(entry, audioFormat, flatPaths);
+  if (prior.audio !== expected.audioRelative || prior.transcript !== expected.transcriptRelative) return false;
+  try {
+    await Promise.all([
+      fs.access(path.join(assetRoot, expected.audioRelative)),
+      fs.access(path.join(assetRoot, expected.transcriptRelative)),
+    ]);
+    prior.assetRoot = assetRoot;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function minimumPlausibleDurationMs(text) {
   const words = String(text).trim().match(/\S+/g) || [];
   const spokenCharacters = String(text).replace(/\s+/g, "").length;
@@ -40,6 +74,13 @@ export function minimumPlausibleDurationMs(text) {
 
 export function isPlausibleDuration(text, durationMs) {
   return Number.isFinite(durationMs) && durationMs >= minimumPlausibleDurationMs(text);
+}
+
+export function shortTranscriptMatches(expected, actual) {
+  const source = String(expected).normalize("NFKC").trim();
+  if (!/^[\p{L}\s'-]+$/u.test(source)) return true;
+  const normalize = value => String(value).normalize("NFKC").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/g, " ");
+  return normalize(source) === normalize(actual);
 }
 
 export function characterCues(text, wordCues, durationMs) {
@@ -102,7 +143,7 @@ function wavFromPcm16(samples, sampleRate) {
   return wav;
 }
 
-export function trimOuterSilence(wav, text) {
+function activityProfile(wav) {
   const { samples, sampleRate } = readPcm16Wav(wav);
   const frameSamples = Math.max(1, Math.round(sampleRate * 0.01));
   const rms = [];
@@ -113,13 +154,20 @@ export function trimOuterSilence(wav, text) {
   }
   const peak = Math.max(0, ...rms);
   if (peak < 200) return null;
-  const threshold = Math.max(180, peak * 0.08);
-  const firstVoicedFrame = rms.findIndex(value => value >= threshold);
-  let lastVoicedFrame = -1;
+  const voicedThreshold = Math.max(180, peak * 0.08);
+  const firstVoiced = rms.findIndex(value => value >= voicedThreshold);
+  let lastVoiced = -1;
   for (let frame = rms.length - 1; frame >= 0; frame -= 1) {
-    if (rms[frame] >= threshold) { lastVoicedFrame = frame; break; }
+    if (rms[frame] >= voicedThreshold) { lastVoiced = frame; break; }
   }
-  if (firstVoicedFrame < 0 || lastVoicedFrame < firstVoicedFrame) return null;
+  if (firstVoiced < 0 || lastVoiced < firstVoiced) return null;
+  return { samples, sampleRate, frameSamples, rms, firstVoiced, lastVoiced, silenceThreshold: Math.max(120, peak * 0.04) };
+}
+
+export function trimOuterSilence(wav, text) {
+  const profile = activityProfile(wav);
+  if (!profile) return null;
+  const { samples, sampleRate, frameSamples, firstVoiced: firstVoicedFrame, lastVoiced: lastVoicedFrame } = profile;
   const paddingSamples = Math.round(sampleRate * 0.08);
   const startSample = Math.max(0, firstVoicedFrame * frameSamples - paddingSamples);
   const endSample = Math.min(samples.length, (lastVoicedFrame + 1) * frameSamples + paddingSamples);
@@ -129,19 +177,142 @@ export function trimOuterSilence(wav, text) {
   return { wav: wavFromPcm16(take, sampleRate), durationMs };
 }
 
+export function extractFirstRepeatedUtterance(wav, text) {
+  const profile = activityProfile(wav);
+  if (!profile || profile.lastVoiced <= profile.firstVoiced) return null;
+  const { samples, sampleRate, frameSamples, rms, firstVoiced, lastVoiced, silenceThreshold } = profile;
+
+  const span = lastVoiced - firstVoiced;
+  const earliestBoundary = firstVoiced + Math.floor(span * 0.4);
+  const latestBoundary = firstVoiced + Math.ceil(span * 0.6);
+  const minimumSilenceFrames = Math.ceil(180 / 10);
+  const candidates = [];
+  let frame = earliestBoundary;
+  while (frame <= latestBoundary) {
+    if (rms[frame] >= silenceThreshold) { frame += 1; continue; }
+    const start = frame;
+    while (frame <= latestBoundary && rms[frame] < silenceThreshold) frame += 1;
+    const end = frame;
+    if (end - start >= minimumSilenceFrames) candidates.push({ start, end });
+  }
+  if (!candidates.length) return null;
+  const midpoint = firstVoiced + span / 2;
+  candidates.sort((left, right) => {
+    const distance = Math.abs((left.start + left.end) / 2 - midpoint) - Math.abs((right.start + right.end) / 2 - midpoint);
+    if (distance !== 0) return distance;
+    return (right.end - right.start) - (left.end - left.start);
+  });
+  const boundary = Math.min(samples.length, candidates[0].start * frameSamples + Math.round(sampleRate * 0.08));
+  return trimOuterSilence(wavFromPcm16(samples.slice(0, boundary), sampleRate), text);
+}
+
+export function extractAnchoredUtterance(wav, text) {
+  const profile = activityProfile(wav);
+  if (!profile || profile.lastVoiced <= profile.firstVoiced) return null;
+  const { samples, sampleRate, frameSamples, rms, firstVoiced, lastVoiced, silenceThreshold } = profile;
+
+  const minimumSilenceFrames = Math.ceil(180 / 10);
+  const minimumTargetFrames = Math.ceil(minimumPlausibleDurationMs(text) / 10);
+  const candidates = [];
+  let frame = firstVoiced + 1;
+  while (frame < lastVoiced) {
+    if (rms[frame] >= silenceThreshold) { frame += 1; continue; }
+    const start = frame;
+    while (frame < lastVoiced && rms[frame] < silenceThreshold) frame += 1;
+    const end = frame;
+    if (end - start >= minimumSilenceFrames && lastVoiced - end >= minimumTargetFrames) candidates.push({ start, end });
+  }
+  if (!candidates.length) return null;
+  candidates.sort((left, right) => (right.end - right.start) - (left.end - left.start));
+  const startSample = Math.max(0, candidates[0].end * frameSamples - Math.round(sampleRate * 0.08));
+  return trimOuterSilence(wavFromPcm16(samples.slice(startSample), sampleRate), text);
+}
+
+export function extractLeadingUtterance(wav, text) {
+  const profile = activityProfile(wav);
+  if (!profile || profile.lastVoiced <= profile.firstVoiced) return null;
+  const { samples, sampleRate, frameSamples, rms, firstVoiced, lastVoiced, silenceThreshold } = profile;
+
+  const minimumSilenceFrames = Math.ceil(180 / 10);
+  const minimumTargetFrames = Math.ceil(minimumPlausibleDurationMs(text) / 10);
+  let frame = firstVoiced + minimumTargetFrames;
+  while (frame < lastVoiced) {
+    if (rms[frame] >= silenceThreshold) { frame += 1; continue; }
+    const start = frame;
+    while (frame < lastVoiced && rms[frame] < silenceThreshold) frame += 1;
+    const end = frame;
+    if (end - start < minimumSilenceFrames || lastVoiced - end < 25) continue;
+    const endSample = Math.min(samples.length, start * frameSamples + Math.round(sampleRate * 0.08));
+    return trimOuterSilence(wavFromPcm16(samples.slice(0, endSample), sampleRate), text);
+  }
+  return null;
+}
+
 export async function generateEntrySpeech(entry, apiKey) {
-  const generated = await generateSpeech(entry, apiKey);
-  if (!isPlausibleDuration(entry.text, generated.durationMs)) throw new Error("Gemini returned implausibly short audio.");
   const words = entry.text.match(/\S+/g) || [];
-  if (words.length > 3) return generated;
-  const trimmed = trimOuterSilence(generated.wav, entry.text);
-  if (!trimmed) throw new Error("Gemini audio did not contain a complete voiced utterance.");
+  let firstError;
+  try {
+    const generated = await generateSpeech(entry, apiKey);
+    if (!isPlausibleDuration(entry.text, generated.durationMs)) throw new Error("Gemini returned implausibly short audio.");
+    if (words.length > 3) return generated;
+    if (generated.transcriptObserved && !shortTranscriptMatches(entry.text, generated.transcript)) throw new Error(`Gemini spoke different short text: ${generated.transcript}`);
+    const trimmed = trimOuterSilence(generated.wav, entry.text);
+    if (!trimmed) throw new Error("Gemini audio did not contain a complete voiced utterance.");
+    const cues = words.map((word, index) => ({
+      word,
+      startMs: Math.round(trimmed.durationMs * index / Math.max(1, words.length)),
+      endMs: Math.round(trimmed.durationMs * (index + 1) / Math.max(1, words.length)),
+    }));
+    return { ...generated, ...trimmed, transcript: entry.text, cues };
+  } catch (error) {
+    firstError = error;
+  }
+  if (words.length > 3) throw firstError;
+
+  let recoverySource;
+  let recovered;
+  try {
+    recoverySource = await generateSpeech(entry, apiKey, { repeatShort: true });
+    recovered = extractFirstRepeatedUtterance(recoverySource.wav, entry.text);
+  } catch {
+    // The anchored recovery below is deliberately the final, bounded fallback.
+  }
+  if (!recovered) {
+    try {
+      recoverySource = await generateSpeech(entry, apiKey, { anchorShort: true });
+      recovered = extractAnchoredUtterance(recoverySource.wav, entry.text);
+    } catch {
+      // A phrase-specific model refusal may still accept an educational suffix.
+    }
+  }
+  if (!recovered) {
+    recoverySource = await generateSpeech(entry, apiKey, { contextShort: true });
+    recovered = extractLeadingUtterance(recoverySource.wav, entry.text);
+  }
+  if (!recovered) throw new Error(`Short-utterance recovery had no proven boundary (initial error: ${firstError instanceof Error ? firstError.message : String(firstError)}).`);
   const cues = words.map((word, index) => ({
     word,
-    startMs: Math.round(trimmed.durationMs * index / Math.max(1, words.length)),
-    endMs: Math.round(trimmed.durationMs * (index + 1) / Math.max(1, words.length)),
+    startMs: Math.round(recovered.durationMs * index / Math.max(1, words.length)),
+    endMs: Math.round(recovered.durationMs * (index + 1) / Math.max(1, words.length)),
   }));
-  return { ...generated, ...trimmed, transcript: entry.text, cues };
+  return { ...recoverySource, ...recovered, transcript: entry.text, cues, wakeMode: "audio-bounded-recovery" };
+}
+
+async function normalizeSelectedCues(entries, assetRoot, audioFormat, flatPaths) {
+  let changed = 0;
+  for (const entry of entries) {
+    const { transcriptRelative } = assetLocations(entry, audioFormat, flatPaths);
+    const transcriptPath = path.join(assetRoot, transcriptRelative);
+    const transcript = JSON.parse(await fs.readFile(transcriptPath, "utf8"));
+    if (transcript.externalId !== entry.externalId || transcript.text !== entry.text || !Number.isFinite(transcript.durationMs) || transcript.durationMs <= 0) {
+      throw new Error(`${entry.externalId}: transcript identity or duration is invalid.`);
+    }
+    const cues = characterCues(entry.text, [], transcript.durationMs);
+    if (JSON.stringify(transcript.cues) === JSON.stringify(cues)) continue;
+    await writeJsonAtomic(transcriptPath, { ...transcript, cues });
+    changed += 1;
+  }
+  return changed;
 }
 
 async function acquireGenerationLock(root) {
@@ -158,7 +329,7 @@ async function acquireGenerationLock(root) {
   }
 }
 
-export async function generateManifest({ manifestPath, envPath, limit = Infinity, concurrency = 4, signal, onProgress = console.log }) {
+export async function generateManifest({ manifestPath, envPath, limit = Infinity, concurrency = 4, locales, assetRootOverride, normalizeCues = false, signal, onProgress = console.log }) {
   const absoluteManifest = path.resolve(manifestPath);
   const root = path.resolve(path.dirname(absoluteManifest), "..");
   const lock = await acquireGenerationLock(root);
@@ -168,26 +339,29 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
   const env = envPath ? parseEnv(await fs.readFile(path.resolve(envPath), "utf8")) : process.env;
   const keys = [1, 2, 3, 4].map((index) => env[`GEMINI_API_KEY${index}`] || process.env[`GEMINI_API_KEY${index}`]).filter(Boolean);
   if (!keys.length) throw new Error("No GEMINI_API_KEY1…4 values were found.");
-  const assetRoot = path.resolve(root, project.project?.assetRoot || "assets/syncvoice");
+  const assetRoot = path.resolve(root, assetRootOverride || project.project?.assetRoot || "assets/syncvoice");
   const audioFormat = String(project.project?.audioFormat || "wav").toLowerCase();
+  const flatPaths = Boolean(assetRootOverride || project.project?.assetRoot);
   const statePath = path.join(root, ".syncvoice", "generation-state.json");
   const state = JSON.parse(await fs.readFile(statePath, "utf8").catch(() => "{\"version\":1,\"entries\":{}}"));
   state.version = 1; state.model = TTS_MODEL; state.entries ||= {};
   let checkpoint = Promise.resolve();
   const checkpointState = () => (checkpoint = checkpoint.then(() => writeJsonAtomic(statePath, state)));
-  const pending = project.entries.filter((entry) => {
-    const hash = hashEntry(entry); const prior = state.entries[entry.externalId];
-    return !prior || prior.hash !== hash || !prior.audio || !isPlausibleDuration(entry.text, Number(prior.durationMs));
-  }).slice(0, Number.isFinite(limit) ? limit : undefined);
+  const selectedEntries = selectedManifestEntries(project.entries, locales);
+  if (locales && !selectedEntries.length) throw new Error(`No manifest entries matched locale filter: ${String(locales)}`);
+  const readiness = await Promise.all(selectedEntries.map(entry => {
+    const hash = hashEntry(entry);
+    return readyInAssetRoot(entry, state.entries[entry.externalId], hash, assetRoot, audioFormat, flatPaths);
+  }));
+  const pending = selectedEntries.filter((_, index) => !readiness[index]).slice(0, Number.isFinite(limit) ? limit : undefined);
+  await checkpointState();
   let cursor = 0; let completed = 0; let failed = 0;
 
   async function worker(workerIndex) {
     while (cursor < pending.length) {
       if (signal?.aborted) return;
-      const entry = pending[cursor++]; const hash = hashEntry(entry); const locale = safePart(entry.locale || "und"); const id = safePart(entry.externalId);
-      const flatPaths = Boolean(project.project?.assetRoot);
-      const audioRelative = flatPaths ? `audio/${id}.${audioFormat}` : `audio/${locale}/${id}.${audioFormat}`;
-      const transcriptRelative = flatPaths ? `transcripts/${id}.json` : `transcripts/${locale}/${id}.json`;
+      const entry = pending[cursor++]; const hash = hashEntry(entry);
+      const { audioRelative, transcriptRelative } = assetLocations(entry, audioFormat, flatPaths);
       const audioPath = path.join(assetRoot, audioRelative); const transcriptPath = path.join(assetRoot, transcriptRelative);
       let lastError;
       for (let attempt = 1; attempt <= 4; attempt += 1) {
@@ -196,7 +370,7 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
           const generated = await generateEntrySpeech(entry, keys[(workerIndex + attempt - 1) % keys.length]);
           await writeAudio(audioPath, generated.wav, audioFormat);
           await writeJsonAtomic(transcriptPath, { version: 1, externalId: entry.externalId, text: entry.text, durationMs: generated.durationMs, cues: characterCues(entry.text, generated.cues, generated.durationMs) });
-          state.entries[entry.externalId] = { hash, audio: audioRelative.replaceAll("\\", "/"), transcript: transcriptRelative.replaceAll("\\", "/"), durationMs: generated.durationMs, generatedAt: new Date().toISOString() };
+          state.entries[entry.externalId] = { hash, assetRoot, audio: audioRelative.replaceAll("\\", "/"), transcript: transcriptRelative.replaceAll("\\", "/"), durationMs: generated.durationMs, generatedAt: new Date().toISOString() };
           completed += 1; await checkpointState(); onProgress({ type: "generated", completed, failed, total: pending.length, id: entry.externalId }); lastError = null; break;
         } catch (error) { lastError = error; if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, attempt * 2_000)); }
       }
@@ -204,10 +378,16 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
     }
   }
   await fs.mkdir(assetRoot, { recursive: true });
-  await Promise.all(Array.from({ length: Math.max(1, Math.min(Number(concurrency) || 1, keys.length, 8)) }, (_, index) => worker(index)));
-  const runtimeEntries = project.entries.map((entry) => ({ ...entry, ...(state.entries[entry.externalId] || {}) })).filter((entry) => entry.audio);
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(Number(concurrency) || 1, 8)) }, (_, index) => worker(index)));
+  const runtimeEntries = (await Promise.all(selectedEntries.map(async entry => {
+    const prior = state.entries[entry.externalId];
+    return await readyInAssetRoot(entry, prior, hashEntry(entry), assetRoot, audioFormat, flatPaths)
+      ? { ...entry, ...prior }
+      : null;
+  }))).filter(Boolean);
+  const normalized = normalizeCues ? await normalizeSelectedCues(runtimeEntries, assetRoot, audioFormat, flatPaths) : 0;
   await writeJsonAtomic(path.join(assetRoot, "manifest.json"), { version: 1, project: project.project, model: TTS_MODEL, generatedAt: new Date().toISOString(), entries: runtimeEntries });
-  return { discovered: project.entries.length, pending: pending.length, completed, failed, ready: runtimeEntries.length, paused: Boolean(signal?.aborted), assetRoot };
+  return { discovered: project.entries.length, selected: selectedEntries.length, pending: pending.length, completed, failed, ready: runtimeEntries.length, normalized, paused: Boolean(signal?.aborted), assetRoot };
   } finally {
     await lock.handle.close().catch(() => undefined);
     await fs.rm(lock.lockPath, { force: true });
@@ -216,8 +396,8 @@ export async function generateManifest({ manifestPath, envPath, limit = Infinity
 
 if (import.meta.url === `file://${process.argv[1].replaceAll("\\", "/")}` || process.argv[1]?.endsWith("generate.mjs")) {
   const args = argsOf(process.argv.slice(2));
-  if (!args.manifest) { console.error("Usage: node agent/generate.mjs --manifest <.syncvoice/project.json> [--env <.env>] [--limit N] [--concurrency N]"); process.exit(2); }
-  generateManifest({ manifestPath: args.manifest, envPath: args.env, limit: args.limit ? Number(args.limit) : Infinity, concurrency: args.concurrency ? Number(args.concurrency) : 4, onProgress: (event) => console.log(JSON.stringify(event)) })
+  if (!args.manifest) { console.error("Usage: node agent/generate.mjs --manifest <.syncvoice/project.json> [--env <.env>] [--locale en-US,fi-FI] [--asset-root <path>] [--normalize-cues] [--limit N] [--concurrency N]"); process.exit(2); }
+  generateManifest({ manifestPath: args.manifest, envPath: args.env, locales: args.locale, assetRootOverride: args["asset-root"], normalizeCues: args["normalize-cues"] === true, limit: args.limit ? Number(args.limit) : Infinity, concurrency: args.concurrency ? Number(args.concurrency) : 4, onProgress: (event) => console.log(JSON.stringify(event)) })
     .then((result) => console.log(JSON.stringify({ type: "complete", ...result })))
     .catch((error) => { console.error(error instanceof Error ? error.stack : String(error)); process.exit(1); });
 }

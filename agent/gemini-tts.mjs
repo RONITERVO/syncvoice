@@ -11,8 +11,10 @@ export function needsAudioWake(text) {
   return (String(text).trim().match(/\S+/g) || []).length <= 3;
 }
 
-function instruction(entry) {
+function instruction(entry, repeatShort = false, anchorShort = false, contextShort = false) {
   const spokenText = /[.!?…:]$/.test(entry.text.trim()) ? entry.text : `${entry.text}.`;
+  const contextTarget = entry.text.trim().replace(/[.!?…:;]+$/u, "");
+  const script = contextShort ? `${contextTarget} — an educational science term used in this school lesson.` : anchorShort ? `Ready.\n\n${spokenText}` : repeatShort ? `${spokenText}\n\n${spokenText}` : spokenText;
   return `You are a professional text-to-speech engine. Read the SCRIPT below aloud exactly as written.
 
 Rules:
@@ -20,13 +22,16 @@ Rules:
 - Preserve the wording, order, language, punctuation, and intent.
 - Speak naturally and clearly, with expressive but restrained delivery.
 - The script may contain only one short word. Always speak it once.
+${repeatShort ? "- Recovery mode: the same short script appears twice. Speak both copies, with a clear pause between the two lines." : ""}
+${anchorShort ? "- Anchored recovery mode: speak the neutral first line, pause clearly, then speak the second line exactly." : ""}
+${contextShort ? "- Context recovery mode: make a clear half-second pause at the em dash; do not speak the punctuation name." : ""}
 - Do not add an introduction, acknowledgement, explanation, or closing.
 - Do not describe these instructions.
 ${entry.direction ? `- Delivery direction (do not speak this): ${entry.direction}` : ""}
 ${entry.locale ? `- Intended locale: ${entry.locale}` : ""}
 
 SCRIPT:
-${spokenText}`;
+${script}`;
 }
 
 function appendTranscript(previous, fragment) {
@@ -45,7 +50,7 @@ function wavBuffer(pcm) {
   return buffer;
 }
 
-export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}) {
+export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000, repeatShort = false, anchorShort = false, contextShort = false } = {}) {
   const chunks = [];
   const cues = [];
   let transcript = "";
@@ -57,6 +62,7 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}
   let textWakeFallback;
   let wakeMode = "text";
   let noAudioTurnCompletions = 0;
+  let transcriptObserved = false;
 
   return new Promise(async (resolve, reject) => {
     let settled = false;
@@ -66,6 +72,7 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}
     function addTranscript(fragment) {
       const normalized = fragment.replace(/\s+/g, " ").trim();
       if (!normalized) return;
+      transcriptObserved = true;
       transcript = appendTranscript(transcript, normalized);
       const words = normalized.match(/\S+/g) || [];
       const startSample = cueEndSample;
@@ -85,14 +92,19 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}
         transcript = entry.text;
       }
       settled = true; cleanup();
-      resolve({ wav: wavBuffer(pcm), transcript, cues, durationMs: Math.round(pcm.length / SAMPLE_RATE * 1_000), wakeMode });
+      resolve({ wav: wavBuffer(pcm), transcript, transcriptObserved, cues, durationMs: Math.round(pcm.length / SAMPLE_RATE * 1_000), wakeMode });
     }
     function startAudioWake(isFallback = false) {
       if (settled || triggerStarted) return;
       triggerStarted = true;
       clearTimeout(textWakeFallback);
       wakeMode = isFallback ? "audio-fallback" : "audio";
-      if (isFallback && !totalSamples) { transcript = ""; cues.length = 0; cueEndSample = 0; }
+      if (isFallback && !totalSamples) {
+        transcript = "";
+        transcriptObserved = false;
+        cues.length = 0;
+        cueEndSample = 0;
+      }
       const chunkBytes = Math.floor(TRIGGER_SAMPLE_RATE * TRIGGER_CHUNK_MS / 1_000) * 2;
       void (async () => {
         const startedAt = Date.now(); let offset = 0;
@@ -110,7 +122,7 @@ export async function generateSpeech(entry, apiKey, { timeoutMs = 180_000 } = {}
       const ai = new GoogleGenAI({ apiKey, httpOptions: { apiVersion: "v1alpha" } });
       session = await ai.live.connect({
         model: TTS_MODEL,
-        config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: entry.voice || "Kore" } } }, systemInstruction: { parts: [{ text: instruction(entry) }] }, outputAudioTranscription: {}, thinkingConfig: { thinkingBudget: 0 } },
+        config: { responseModalities: [Modality.AUDIO], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: entry.voice || "Kore" } } }, systemInstruction: { parts: [{ text: instruction(entry, repeatShort, anchorShort, contextShort) }] }, outputAudioTranscription: {}, thinkingConfig: { thinkingBudget: 0 } },
         callbacks: {
           onopen: () => undefined,
           onmessage(message) {

@@ -20,6 +20,9 @@ export function AgentPanel() {
   const [token, setToken] = useState("");
   const [workspace, setWorkspace] = useState("");
   const [envPath, setEnvPath] = useState("");
+  const [generationLocales, setGenerationLocales] = useState("");
+  const [assetRoot, setAssetRoot] = useState("");
+  const [normalizeCues, setNormalizeCues] = useState(false);
   const [mission, setMission] = useState("Discover every spoken line, prepare durable voice assets, integrate synchronized playback, and preserve the current fallback behavior.");
   const [connected, setConnected] = useState(false);
   const [job, setJob] = useState<AgentJob | null>(null);
@@ -31,6 +34,9 @@ export function AgentPanel() {
     setToken(localStorage.getItem("syncvoice.agent.token") || "");
     setWorkspace(localStorage.getItem("syncvoice.agent.workspace") || "");
     setEnvPath(localStorage.getItem("syncvoice.agent.envPath") || "");
+    setGenerationLocales(localStorage.getItem("syncvoice.agent.locales") || "");
+    setAssetRoot(localStorage.getItem("syncvoice.agent.assetRoot") || "");
+    setNormalizeCues(localStorage.getItem("syncvoice.agent.normalizeCues") === "true");
     setOpen(true);
   }
 
@@ -62,7 +68,10 @@ export function AgentPanel() {
     try {
       localStorage.setItem("syncvoice.agent.workspace", workspace);
       if (envPath) localStorage.setItem("syncvoice.agent.envPath", envPath);
-      const created = await request<AgentJob>("/jobs", { method: "POST", body: JSON.stringify({ mode, workspace, mission, envPath, concurrency: 4 }) });
+      localStorage.setItem("syncvoice.agent.locales", generationLocales);
+      localStorage.setItem("syncvoice.agent.assetRoot", assetRoot);
+      localStorage.setItem("syncvoice.agent.normalizeCues", String(normalizeCues));
+      const created = await request<AgentJob>("/jobs", { method: "POST", body: JSON.stringify({ mode, workspace, mission, envPath, generationLocales, assetRoot, normalizeCues, concurrency: 4 }) });
       setJob(created); setConnected(true);
     } catch (caught) { setError(caught instanceof Error ? caught.message : "Could not start the Production Agent."); }
     finally { setBusy(false); }
@@ -109,6 +118,9 @@ export function AgentPanel() {
                 <label>Game repository<input value={workspace} onChange={(event) => setWorkspace(event.target.value)} placeholder="D:\Projects\MyGame" /></label>
                 <label>Production mission<textarea value={mission} onChange={(event) => setMission(event.target.value)} /></label>
                 <label>Gemini keys file <span>(generation only)</span><input value={envPath} onChange={(event) => setEnvPath(event.target.value)} placeholder="D:\secure\tts.env" /></label>
+                <label>Locales <span>(optional generation shard)</span><input value={generationLocales} onChange={(event) => setGenerationLocales(event.target.value)} placeholder="en-US,fi-FI" /></label>
+                <label>Asset output folder <span>(optional companion repository)</span><input value={assetRoot} onChange={(event) => setAssetRoot(event.target.value)} placeholder="D:\Projects\MyGame-audio\assets\syncvoice" /></label>
+                <label className="agent-check"><input type="checkbox" checked={normalizeCues} onChange={(event) => setNormalizeCues(event.target.checked)} /><span><strong>Normalize transcript timing</strong><small>Opt in to even full-duration cue pacing. Leave off to preserve Gemini's naturally observed transcript timing.</small></span></label>
                 <div className="agent-actions">
                   <button onClick={() => void run("plan")} disabled={busy || job?.status === "running"}><FolderSearch2 size={16} /> Analyze safely</button>
                   <button className="agent-apply" onClick={() => void run("apply")} disabled={busy || job?.status === "running"}><Play size={16} /> Apply production plan</button>
@@ -122,7 +134,7 @@ export function AgentPanel() {
               <div className="agent-run">
                 <div className="agent-run-head"><span className={`agent-run-state ${job.status}`}>{job.status === "running" && <LoaderCircle className="spin" size={13} />}{job.status}</span>{job.status === "running" ? <button onClick={() => void pause()}>Pause safely</button> : job.output?.result?.entriesDiscovered !== undefined && <span>{job.output.result.entriesDiscovered.toLocaleString()} entries discovered</span>}</div>
                 <div className="agent-events">{latestEvents.map((event, index) => <div key={`${event.at}-${index}`}><i /><span>{event.message}</span></div>)}</div>
-                {job.output?.result?.summary && <div className="agent-result"><strong>Agent handoff</strong><p>{job.output.result.summary}</p>{Boolean(job.output.result.filesChanged?.length) && <small>{job.output.result.filesChanged!.length} files changed</small>}</div>}
+                {job.output?.result?.summary && <div className="agent-result"><strong>Agent handoff</strong><p>{job.output.result.summary}</p>{Boolean(job.output.result.filesChanged?.length) && <div className="agent-result-paths"><small>{job.output.result.filesChanged!.length} output paths</small>{job.output.result.filesChanged!.map(file => <code key={file}>{file}</code>)}</div>}</div>}
               </div>
             )}
           </section>
